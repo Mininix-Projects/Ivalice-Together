@@ -1,0 +1,54 @@
+# Python caches and test output
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+.env
+.env.*
+
+# Generated build and release output
+artefatos/
+publicacao/
+
+# Native build products
+fontes_nativos/build*/
+fontes_nativos/*.dll
+fontes_nativos/*.exe
+fontes_nativos/*.obj
+fontes_nativos/*.o
+fontes_nativos/*.pdb
+fontes_nativos/*.lib
+fontes_nativos/*.exp
+
+# Frozen Python builds and copied runtime state
+source/build/
+source/dist/
+source/_fora_do_coop/
+source/runtime_selftest/
+source/*.dll
+source/*.exe
+source/*.bin
+source/*.log
+source/*.json
+
+# Local game assets are intentionally excluded from source control.
+source/assets/
+source/extracted_ui_assets/
+source/extracted_ui_assets_png/
+source/game_overrides/
+source/imgui_skin_menu/
+source/launcher_assets/
+source/runtime_ui_assets_png/

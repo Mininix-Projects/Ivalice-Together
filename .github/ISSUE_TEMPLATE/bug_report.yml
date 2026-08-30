@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible Ivalice Together problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach copyrighted game archives or private save data.
+  - type: input
+    id: version
+    attributes:
+      label: Ivalice Together version
+      placeholder: "1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Manual
+        - Mod Organizer 2
+        - Vortex
+    validations:
+      required: true
+  - type: input
+    id: controllers
+    attributes:
+      label: Controllers and connection method
+      description: Include USB, Bluetooth, Steam Input, DS4Windows, or other layers.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: Describe the shortest reliable sequence that causes the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      render: text
