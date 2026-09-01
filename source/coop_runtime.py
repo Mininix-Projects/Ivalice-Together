@@ -8481,10 +8481,14 @@ def follower_action_approach_gate_patch(cave_address):
 
 def build_follower_action_approach_gate_cave(cave_address, command_block):
     code = bytearray()
+    # Preserve the native leader comparison while controlled-actor identity is
+    # resolved.  A surviving follower becomes FF12's temporary native leader
+    # when P1 is KO; allowing that comparison to return first lets the native
+    # target-approach controller fight the follower movement mailbox.  Resolve
+    # manual ownership first, then replay the exact native flags for every
+    # actor that is not controlled by co-op.
     code += b"\x3b\xc3"
-    native_leader = len(code)
-    code += b"\x74\x00"
-    code += b"\x41\x53"
+    code += b"\x9c\x41\x53"
     code += b"\x49\xbb" + struct.pack("<Q", command_block)
     code += b"\x41\x83\x7b" + bytes((COOP_ACTIVE_OFFSET,)) + b"\x00"
     inactive = len(code)
@@ -8510,26 +8514,18 @@ def build_follower_action_approach_gate_cave(cave_address, command_block):
     code += b"\x74\x00"
 
     native_follower = len(code)
-    code += b"\x41\x5b"
-
-    code += b"\x48\x85\xff"
+    code += b"\x41\x5b\x9d"
     code += b"\x48\x8b\x5c\x24\x30"
     jump_site = cave_address + len(code)
     code += b"\xe9" + rel32(jump_site, 5, FOLLOWER_ACTION_APPROACH_GATE_RETURN)
 
     controlled = len(code)
-    code += b"\x41\x5b"
+    code += b"\x41\x5b\x9d"
     code += b"\x48\x8b\x5c\x24\x30"
     jump_site = cave_address + len(code)
     code += b"\xe9" + rel32(jump_site, 5, FOLLOWER_ACTION_APPROACH_NO_APPROACH)
 
-    leader_path = len(code)
-    code += b"\x48\x8b\x5c\x24\x30"
-    jump_site = cave_address + len(code)
-    code += b"\xe9" + rel32(jump_site, 5, FOLLOWER_ACTION_APPROACH_GATE_RETURN)
-
     for branch, target in (
-        (native_leader, leader_path),
         (inactive, native_follower),
         (p1_inactive, p2_check),
         (p1_match, controlled),

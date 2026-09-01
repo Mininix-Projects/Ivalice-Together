@@ -64,8 +64,31 @@ class FollowerActionApproachCaveTests(unittest.TestCase):
         self.assertIn("cmp eax, ebx", self.text)
         self.assertEqual(
             self.text.count("mov rbx, qword ptr [rsp + 0x30]"),
-            3,
+            2,
         )
+
+    def test_controlled_identity_wins_over_temporary_native_leadership(self):
+        instructions = [
+            (mnemonic, operands)
+            for _address, mnemonic, operands, _size in self.instructions
+        ]
+        native_compare = instructions.index(("cmp", "eax, ebx"))
+        saved_flags = instructions.index(("pushfq", ""))
+        p2_compare = instructions.index(
+            ("cmp", "rdi, qword ptr [r11 + 0x10]")
+        )
+        p3_actor = movement.P3_COMMAND_BLOCK_OFFSET - 0x200 + movement.P3_ACTOR_OFFSET
+        p3_compare = instructions.index(
+            ("cmp", f"rdi, qword ptr [r11 + {p3_actor:#x}]")
+        )
+        first_restore = instructions.index(("popfq", ""))
+
+        self.assertLess(native_compare, saved_flags)
+        self.assertLess(saved_flags, p2_compare)
+        self.assertLess(p2_compare, p3_compare)
+        self.assertLess(p3_compare, first_restore)
+        self.assertEqual(self.text.count("pushfq "), 1)
+        self.assertEqual(self.text.count("popfq "), 2)
 
     def test_controlled_players_jump_to_native_no_approach_epilogue(self):
         target = movement.FOLLOWER_ACTION_APPROACH_NO_APPROACH
@@ -101,8 +124,10 @@ class FollowerActionApproachCaveTests(unittest.TestCase):
             self.text,
         )
 
-    def test_native_follower_exit_deliberately_leaves_zf_clear(self):
-        self.assertIn("test rdi, rdi", self.text)
+    def test_native_exit_restores_the_exact_original_comparison_flags(self):
+        self.assertNotIn("test rdi, rdi", self.text)
+        self.assertEqual(self.text.count("pushfq "), 1)
+        self.assertEqual(self.text.count("popfq "), 2)
 
     def test_every_local_branch_lands_on_an_instruction_boundary(self):
         boundaries = {address for address, _m, _o, _s in self.instructions}
