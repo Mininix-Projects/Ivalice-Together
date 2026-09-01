@@ -1547,6 +1547,25 @@ def test_every_player_follows_the_native_decide_button(tmp_path: Path):
         assert not poller.native_action_down(player, "confirm", circle_decides=False)
 
 
+def test_p1_configured_a_confirm_becomes_b_when_the_game_uses_b_confirm(
+    tmp_path: Path,
+):
+    path = tmp_path / "controller_config.json"
+    config = controls.default_config()
+    config["devices"]["p1"] = 0
+    config["players"]["p1"]["confirm"] = [controls.pad_binding(0, "A")]
+    config["players"]["p1"]["cancel"] = [controls.pad_binding(0, "B")]
+    controls.save_config(config, path)
+    poller = controls.BindingPoller(path)
+    state = controls.XINPUT_STATE()
+    state.Gamepad.wButtons = controls.XINPUT_BUTTONS["B"]
+    poller._enabled = True
+    poller._states = [state, None, None, None]
+
+    assert poller.native_action_edge("p1", "confirm", circle_decides=True)
+    assert not poller.native_action_edge("p1", "cancel", circle_decides=True)
+
+
 def test_native_decide_setting_swaps_p2_confirm_and_cancel(tmp_path: Path):
     path = tmp_path / "controller_config.json"
     config = controls.default_config()

@@ -51,9 +51,9 @@ class NativeActionLineThemeRouterTests(unittest.TestCase):
         cave = menu.build_action_line_theme_cave(router.cave, router.state)
         self.assertEqual(cave.count(b"\x83\xf8\x01"), 3)
         self.assertIn(b"\x8b\x96\xd0\x02\x00\x00", cave)
-        self.assertIn(b"\x41\x81\x4a\x0c\x00\x01\x00\x00", cave)
-        self.assertIn(b"\x41\x81\x4a\x14\x00\x01\x00\x00", cave)
-        self.assertIn(b"\x41\x81\x4a\x1c\x00\x01\x00\x00", cave)
+        self.assertNotIn(b"\x41\x81\x4a\x0c\x00\x01\x00\x00", cave)
+        self.assertNotIn(b"\x41\x81\x4a\x14\x00\x01\x00\x00", cave)
+        self.assertNotIn(b"\x41\x81\x4a\x1c\x00\x01\x00\x00", cave)
         self.assertNotIn(b"\x41\x83\x7a\x0c\x04", cave)
         self.assertNotIn(b"\x41\x83\x7a\x14\x04", cave)
         self.assertNotIn(b"\x41\x83\x7a\x1c\x04", cave)
@@ -80,8 +80,11 @@ class NativeActionLineThemeRouterTests(unittest.TestCase):
         )
         self.assertTrue(targetline_cave.startswith(b"\x49\xba"))
         self.assertIn(b"\x45\x8b\x87\x10\x08\x00\x00", targetline_cave)
-        self.assertEqual(targetline_cave.count(b"\xa9\x00\x01\x00\x00"), 3)
-        self.assertIn(b"\xb8\x01\x00\x00\x00", targetline_cave)
+        self.assertNotIn(b"\xa9\x00\x01\x00\x00", targetline_cave)
+        self.assertNotIn(b"\xb8\x01\x00\x00\x00", targetline_cave)
+        self.assertIn(b"\x41\x8b\x42\x0c", targetline_cave)
+        self.assertIn(b"\x41\x8b\x42\x14", targetline_cave)
+        self.assertIn(b"\x41\x8b\x42\x1c", targetline_cave)
         self.assertEqual(
             targetline_cave[-14:-5],
             menu.ACTION_TARGETLINE_RENDER_ORIGINAL,
