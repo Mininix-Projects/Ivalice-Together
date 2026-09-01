@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import controller_bindings as controls
@@ -1446,8 +1447,14 @@ class LauncherIdleLifecycleTests(unittest.TestCase):
         app.last_process_poll = 0.0
         app.game_open = True
         app.in_tray = True
+        app.taskbar_minimized = False
+        app.page = "home"
+        app.window_focused = True
+        app.last_controller_state_poll = 0.0
         app.restore_from_tray = mock.Mock()
+        app.restore_from_taskbar = mock.Mock()
         app.hide_to_tray = mock.Mock()
+        app.minimize_to_taskbar = mock.Mock()
         app.launcher = mock.Mock()
         app.audio = mock.Mock()
         app.config = {"minimize_when_ready": True}
@@ -1460,6 +1467,17 @@ class LauncherIdleLifecycleTests(unittest.TestCase):
         with mock.patch.object(coop_launcher.core, "process_ids", return_value=()):
             self.assertTrue(app.update_launcher())
         app.restore_from_tray.assert_called_once_with()
+        self.assertFalse(app.game_open)
+
+    def test_game_close_restores_a_taskbar_minimized_launcher(self):
+        app = self.make_app()
+        app.in_tray = False
+        app.taskbar_minimized = True
+        app.launcher.drain.return_value = []
+        with mock.patch.object(coop_launcher.core, "process_ids", return_value=()):
+            self.assertTrue(app.update_launcher())
+        app.restore_from_taskbar.assert_called_once_with()
+        app.restore_from_tray.assert_not_called()
         self.assertFalse(app.game_open)
 
     def test_game_open_keeps_visible_controls_discovery_active(self):
@@ -1533,12 +1551,53 @@ class LauncherIdleLifecycleTests(unittest.TestCase):
         app.suspend_controller_discovery.assert_called_once_with()
         self.assertEqual(app.controller_recovery_at, 10.75)
 
-    def test_ready_event_sends_the_launcher_to_tray(self):
+    def test_ready_event_minimizes_the_launcher_to_the_taskbar(self):
         app = self.make_app()
+        app.in_tray = False
         app.last_process_poll = time.monotonic()
         app.launcher.drain.return_value = [launcher_core.LaunchEvent("ready", "ready")]
         self.assertTrue(app.update_launcher())
-        app.hide_to_tray.assert_called_once_with()
+        app.minimize_to_taskbar.assert_called_once_with()
+        app.hide_to_tray.assert_not_called()
+
+    def test_runtime_error_restores_a_taskbar_minimized_launcher(self):
+        app = self.make_app()
+        app.in_tray = False
+        app.taskbar_minimized = True
+        app.last_process_poll = time.monotonic()
+        app.launcher.drain.return_value = [launcher_core.LaunchEvent("error", "failed")]
+
+        self.assertTrue(app.update_launcher())
+
+        app.audio.play.assert_called_once_with("error")
+        app.restore_from_taskbar.assert_called_once_with()
+        app.restore_from_tray.assert_not_called()
+
+    def test_taskbar_minimize_keeps_the_window_out_of_tray(self):
+        app = coop_launcher.LauncherApp.__new__(coop_launcher.LauncherApp)
+        app.in_tray = False
+        app.taskbar_minimized = False
+        app.window_focused = True
+        app.tray = mock.Mock()
+        app.native_window_handle = mock.Mock(return_value=321)
+        app.suspend_controller_discovery = mock.Mock()
+        user32 = mock.Mock()
+        windows = SimpleNamespace(user32=user32)
+
+        with mock.patch.object(
+            coop_launcher,
+            "ctypes",
+            SimpleNamespace(windll=windows),
+        ):
+            app.minimize_to_taskbar()
+
+        user32.ShowWindowAsync.assert_called_once_with(321, 6)
+        app.tray.show.assert_not_called()
+        app.tray.hide.assert_not_called()
+        self.assertFalse(app.in_tray)
+        self.assertTrue(app.taskbar_minimized)
+        self.assertFalse(app.window_focused)
+        app.suspend_controller_discovery.assert_called_once_with()
 
     def test_close_stays_in_tray_while_runtime_uses_the_bundle(self):
         app = self.make_app()

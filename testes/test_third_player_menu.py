@@ -33,6 +33,32 @@ class MemoryProcess:
 
 
 class ThirdPlayerMenuTests(unittest.TestCase):
+    def test_applied_role_override_updates_hud_identity_before_next_snapshot(self):
+        shell = live.CoopMenuRuntime.__new__(live.CoopMenuRuntime)
+        shell.base = 0x100000
+        shell.process = MemoryProcess()
+        shell.active_party = [
+            (5, "Penelo", 0x100005, 0x70000500),
+            (4, "Basch", 0x100004, 0x70000400),
+        ]
+        shell.session_snapshot = SimpleNamespace(
+            identity=session_state.SessionIdentity(5, 4),
+            p1_owner_party_member_id=5,
+            current_layout=(5, 4, *([session_state.EMPTY_PARTY_ID] * 7)),
+        )
+        shell.live_role_identity_override = session_state.SessionIdentity(4, 5)
+        shell.process.put(
+            shell.base + live.P1_CONTROLLED_ACTOR_OFFSET,
+            struct.pack("<Q", 0x70000400),
+        )
+        shell.process.put(
+            shell.base + live.P2_CONTROLLED_ACTOR_OFFSET,
+            struct.pack("<Q", 0x70000500),
+        )
+
+        self.assertEqual(shell._controlled_member_id(1), 4)
+        self.assertEqual(shell._controlled_member_id(2), 5)
+
     def test_character_selector_keeps_the_players_current_theme_until_commit(self):
         self.assertEqual(
             live.character_selector_theme(
@@ -340,6 +366,10 @@ class ThirdPlayerMenuTests(unittest.TestCase):
         self.assertEqual(source.count('repeat("p2", "menu_down")'), 1)
         self.assertEqual(source.count('repeat("p3", "menu_up")'), 1)
         self.assertEqual(source.count('repeat("p3", "menu_down")'), 1)
+        self.assertEqual(source.count('"p2", "menu_up", accelerated=True'), 1)
+        self.assertEqual(source.count('"p2", "menu_down", accelerated=True'), 1)
+        self.assertEqual(source.count('"p3", "menu_up", accelerated=True'), 1)
+        self.assertEqual(source.count('"p3", "menu_down", accelerated=True'), 1)
 
     def test_native_frontend_reuses_the_already_sampled_vertical_pulse(self) -> None:
         source = inspect.getsource(live.CoopMenuRuntime._route_native_frontend_input)
@@ -1804,6 +1834,72 @@ class ThirdPlayerMenuTests(unittest.TestCase):
         self.assertFalse(live.native_party_recovery_required((False, True)))
         self.assertFalse(live.native_party_recovery_required((False, None)))
 
+    def test_dead_party_recovery_passthrough_survives_native_role_promotion(self):
+        required = live.native_party_recovery_passthrough_required
+        self.assertTrue(
+            required(
+                (False, False),
+                latched=False,
+                native_menu_observed=False,
+                native_menu_open=False,
+                native_frontend_suspended=False,
+                suspension_source="",
+            )
+        )
+        self.assertTrue(
+            required(
+                (True, False),
+                latched=True,
+                native_menu_observed=True,
+                native_menu_open=True,
+                native_frontend_suspended=True,
+                suspension_source="dead_party_recovery",
+            )
+        )
+        self.assertTrue(
+            required(
+                (True, False),
+                latched=True,
+                native_menu_observed=True,
+                native_menu_open=False,
+                native_frontend_suspended=True,
+                suspension_source="dead_party_recovery",
+            )
+        )
+        self.assertFalse(
+            required(
+                (True, False),
+                latched=True,
+                native_menu_observed=True,
+                native_menu_open=False,
+                native_frontend_suspended=False,
+                suspension_source="",
+            )
+        )
+
+    def test_dead_party_native_frontend_ignores_role_generation_change(self):
+        shell = live.CoopMenuRuntime.__new__(live.CoopMenuRuntime)
+        shell.native_frontend_custom_suspended = True
+        shell.native_frontend_suspended_battle_info = 0x500000
+        shell.native_frontend_suspended_role_generation = 4
+        shell.native_frontend_suspension_source = "dead_party_recovery"
+        shell.native_frontend_close_candidate_since = 0.0
+        shell.native_frontend_observed_open = True
+        shell.native_frontend_open_candidate_since = None
+        shell.native_party_menu_request_pending = False
+        shell.native_party_menu_active = True
+        shell.unexpected_native_menu_cancel_latched = False
+        shell.role_generation = 5
+        shell.abort_native_frontend_suspension = mock.Mock()
+
+        shell.maintain_native_frontend_suspension(
+            self.ui_snapshot(native_menu_open=True),
+            now=10.0,
+        )
+
+        shell.abort_native_frontend_suspension.assert_not_called()
+        self.assertEqual(shell.native_frontend_suspended_role_generation, 5)
+
     def test_dead_party_recovery_releases_native_input_before_frontend_routing(self):
         source = inspect.getsource(live.CoopMenuRuntime.input)
         recovery = source.index("if dead_party_recovery:")
@@ -1963,7 +2059,7 @@ class ThirdPlayerMenuTests(unittest.TestCase):
     def test_p3_input_uses_only_the_configured_third_player_bindings(self):
         source = inspect.getsource(live.CoopMenuRuntime.input)
         handler = inspect.getsource(live.CoopMenuRuntime._handle_p3_battle_input)
-        self.assertIn('self.bindings.repeat("p3", "menu_up")', source)
+        self.assertIn('"p3", "menu_up", accelerated=True', source)
         self.assertIn(
             'self.bindings.native_action_edge(\n            "p3",\n            "confirm"',
             source,
@@ -2019,11 +2115,11 @@ class ThirdPlayerMenuTests(unittest.TestCase):
         ) + inspect.getsource(live.CoopMenuRuntime._handle_p3_battle_input)
         for player in ("p2", "p3"):
             self.assertIn(
-                f'self.bindings.repeat("{player}", "menu_up")',
+                f'"{player}", "menu_up", accelerated=True',
                 source,
             )
             self.assertIn(
-                f'self.bindings.repeat("{player}", "menu_down")',
+                f'"{player}", "menu_down", accelerated=True',
                 source,
             )
             self.assertIn(f"{player}_character_direction_ready", source)
@@ -2031,6 +2127,12 @@ class ThirdPlayerMenuTests(unittest.TestCase):
         self.assertIn("self.open_p3_character_selector()", handlers)
         self.assertEqual(live.CHARACTER_SELECTOR_EXIT_DELAY, 0.30)
         self.assertLessEqual(live.MENU_REOPEN_QUIET_SECONDS, 0.10)
+
+    def test_triangle_fast_scroll_is_list_only_and_consumes_party_menu_edge(self):
+        source = inspect.getsource(live.CoopMenuRuntime.input)
+        self.assertIn('model.mode is MenuMode.LIST', source)
+        self.assertIn('self.bindings.down(player, "native_party_menu")', source)
+        self.assertIn('native_party_menu_edges[player] = False', source)
 
     def test_wait_mode_counts_the_third_menu_as_a_command_menu(self):
         source = inspect.getsource(live.CoopMenuRuntime.update_frame)
@@ -2735,7 +2837,7 @@ class ThirdPlayerMenuTests(unittest.TestCase):
             source.index("self._handle_p2_battle_input("),
         )
 
-    def test_character_role_candidates_exclude_every_guest_and_p1(self):
+    def test_stable_p1_is_an_exchange_candidate_but_guests_never_are(self):
         for p1_member_id in session_state.MAIN_PARTY_MEMBER_IDS:
             for member_id in range(15):
                 with self.subTest(
@@ -2746,10 +2848,91 @@ class ThirdPlayerMenuTests(unittest.TestCase):
                         live.coop_character_role_candidate(
                             member_id,
                             p1_member_id,
+                            p1_member_id,
                         ),
-                        member_id in session_state.MAIN_PARTY_MEMBER_IDS
-                        and member_id != p1_member_id,
+                        member_id in session_state.MAIN_PARTY_MEMBER_IDS,
                     )
+
+    def test_transient_p1_owners_are_not_exchange_candidates(self):
+        for member_id in range(15):
+            with self.subTest(member_id=member_id):
+                self.assertEqual(
+                    live.coop_character_role_candidate(member_id, 3, 0),
+                    member_id in session_state.MAIN_PARTY_MEMBER_IDS
+                    and member_id not in (0, 3),
+                )
+
+    def test_p2_selecting_p1_routes_one_atomic_owner_exchange(self):
+        shell = live.CoopMenuRuntime.__new__(live.CoopMenuRuntime)
+        p1_actor = 0xABC000
+        p2_actor = 0xABD000
+        p1_keep = 0xDEF000
+        p2_keep = 0xDEE000
+        p1_handle = 0x100000
+        p2_handle = 0x100005
+        shell.session_snapshot = SimpleNamespace(
+            identity=session_state.SessionIdentity(0, 5, 1),
+            p1_owner_party_member_id=0,
+            p1_reserved_party_member_id=0,
+        )
+        shell.active_party = [
+            (0, "Vaan", p1_handle, p1_actor),
+            (5, "Penelo", p2_handle, p2_actor),
+        ]
+        shell.process = mock.Mock()
+        shell.process.u64.side_effect = lambda address: {
+            p1_actor + 0x698: p1_keep,
+            p2_actor + 0x698: p2_keep,
+            p1_actor: 0,
+            p2_actor: 0,
+        }.get(address, 0)
+        shell.process.u32.side_effect = lambda address: {
+            p1_keep + 0x48: 100,
+            p2_keep + 0x48: 100,
+        }.get(address, 0)
+        shell.select_p1_leader = mock.Mock(return_value=1)
+
+        with mock.patch.object(session_state, "save_identity") as save:
+            self.assertEqual(shell.select_coop_character(2, p1_handle), 1)
+
+        shell.select_p1_leader.assert_called_once_with(p2_handle)
+        save.assert_not_called()
+
+    def test_p3_selecting_p1_routes_one_atomic_owner_exchange(self):
+        shell = live.CoopMenuRuntime.__new__(live.CoopMenuRuntime)
+        p1_actor = 0xABC000
+        p3_actor = 0xABE000
+        p1_keep = 0xDEF000
+        p3_keep = 0xDED000
+        p1_handle = 0x100000
+        p3_handle = 0x100001
+        shell.session_snapshot = SimpleNamespace(
+            identity=session_state.SessionIdentity(0, 5, 1),
+            p1_owner_party_member_id=0,
+            p1_reserved_party_member_id=0,
+        )
+        shell.active_party = [
+            (0, "Vaan", p1_handle, p1_actor),
+            (1, "Ashe", p3_handle, p3_actor),
+        ]
+        shell.process = mock.Mock()
+        shell.process.u64.side_effect = lambda address: {
+            p1_actor + 0x698: p1_keep,
+            p3_actor + 0x698: p3_keep,
+            p1_actor: 0,
+            p3_actor: 0,
+        }.get(address, 0)
+        shell.process.u32.side_effect = lambda address: {
+            p1_keep + 0x48: 100,
+            p3_keep + 0x48: 100,
+        }.get(address, 0)
+        shell.select_p1_leader = mock.Mock(return_value=1)
+
+        with mock.patch.object(session_state, "save_identity") as save:
+            self.assertEqual(shell.select_coop_character(3, p1_handle), 1)
+
+        shell.select_p1_leader.assert_called_once_with(p3_handle)
+        save.assert_not_called()
 
     def test_character_commit_rejects_guest_before_actor_or_config_access(self):
         shell = live.CoopMenuRuntime.__new__(live.CoopMenuRuntime)

@@ -19,6 +19,8 @@ class InputCommand(Enum):
     TOGGLE = auto()
     UP = auto()
     DOWN = auto()
+    UP_REPEAT = auto()
+    DOWN_REPEAT = auto()
     PAGE_UP = auto()
     PAGE_DOWN = auto()
     CONFIRM = auto()
@@ -71,6 +73,10 @@ class HeadlessFrontendController:
             return FrontendResult(self.model.navigate(-1))
         if command is InputCommand.DOWN:
             return FrontendResult(self.model.navigate(1))
+        if command is InputCommand.UP_REPEAT:
+            return FrontendResult(self.model.navigate(-1, wrap=False))
+        if command is InputCommand.DOWN_REPEAT:
+            return FrontendResult(self.model.navigate(1, wrap=False))
         if command is InputCommand.PAGE_UP:
             if self.model.mode is not MenuMode.LIST:
                 return FrontendResult(MenuEvent("ignored"))

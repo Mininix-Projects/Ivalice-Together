@@ -5607,6 +5607,22 @@ def request_native_leader_role_transfer(
     replacement = native_leader_role_permutation(current_identity, target_member_id)
     current_members = _role_identity_members(current_identity)
     replacement_members = () if replacement is None else _role_identity_members(replacement)
+    changed_members = tuple(
+        member_id
+        for current_member, member_id in zip(
+            (
+                current_identity.p1_party_member_id,
+                current_identity.p2_party_member_id,
+                current_identity.p3_party_member_id,
+            ),
+            (
+                replacement.p1_party_member_id,
+                replacement.p2_party_member_id,
+                replacement.p3_party_member_id,
+            ),
+        )
+        if member_id is not None and member_id != current_member
+    )
     if (
         replacement is None
         or replacement.p1_party_member_id != target_member_id
@@ -5615,7 +5631,7 @@ def request_native_leader_role_transfer(
         or any(member_id not in session_state.MAIN_PARTY_MEMBER_IDS for member_id in replacement_members)
         or any(
             not role_member_layout_coherent(member_id, current_layout, ui_layout)
-            for member_id in replacement_members
+            for member_id in changed_members
         )
     ):
         raise ValueError("leader transfer must be a coherent permutation of player roles")
@@ -5652,8 +5668,11 @@ def request_native_leader_role_transfer(
             return INVALID_HUD_PARTY_SLOT
         try:
             return tuple(current_layout[:4]).index(int(member_id))
-        except ValueError as error:
-            raise ValueError("role member is absent from current layout") from error
+        except ValueError:
+            # A configured role can remain reserved while its character is out
+            # of the active party.  It is not part of this two-seat swap and has
+            # no HUD row until it materializes again.
+            return INVALID_HUD_PARTY_SLOT
 
     sequence = None
     try:
@@ -6358,23 +6377,51 @@ def settle_native_leader_role_transfer_publishers(process, transfer) -> bool:
 
     publishers = (
         (
+            "p2",
             movement_mailbox.publisher_for(process, P2_MOVEMENT_MAILBOX),
             transfer.p2_movement_sequence if transfer is not None else 0,
         ),
         (
+            "p3",
             movement_mailbox.publisher_for(process, P3_MOVEMENT_MAILBOX),
             transfer.p3_movement_sequence if transfer is not None else 0,
         ),
     )
     if transfer is not None and transfer.native_applied:
         complete = True
-        for publisher, sequence in publishers:
+        committed = []
+        for role, publisher, sequence in publishers:
             if not sequence:
                 continue
             if publisher.reserved is not None:
                 complete = publisher.finalize_reserved(sequence) and complete
             elif publisher.sequence != sequence:
                 complete = publisher.adopt_committed(sequence) and complete
+            if publisher.sequence != sequence or publisher.last_command is None:
+                complete = False
+            committed.append((role, publisher, sequence))
+        if complete:
+            mirror_generations = getattr(
+                process,
+                "_native_leader_legacy_mirror_generations",
+                {},
+            )
+            for role, publisher, sequence in committed:
+                generation = (int(transfer.sequence), int(sequence))
+                if mirror_generations.get(role) == generation:
+                    continue
+                if role == "p2":
+                    synchronize_second_player_legacy_movement_mirror(
+                        process,
+                        publisher.last_command,
+                    )
+                else:
+                    synchronize_third_player_legacy_movement_mirror(
+                        process,
+                        publisher.last_command,
+                    )
+                mirror_generations[role] = generation
+            process._native_leader_legacy_mirror_generations = mirror_generations
         return complete
     if transfer is not None:
         claimed = process.u32(
@@ -6382,7 +6429,7 @@ def settle_native_leader_role_transfer_publishers(process, transfer) -> bool:
         )
         if claimed == transfer.sequence:
             return False
-    for publisher, _sequence in publishers:
+    for _role, publisher, _sequence in publishers:
         publisher.cancel_reserved()
     return False
 
@@ -6540,11 +6587,13 @@ def native_leader_role_prepare_mismatch_signature(transfer, snapshot):
         ui_layout,
     )
     observed_members = set(current_members)
-    desired_members = set(_role_identity_members(transfer.identity))
-    if (
-        observed_generation == transfer.layout_generation
-        and observed_members == desired_members
-    ):
+    # The identity also retains configured roles which are currently in
+    # reserve.  They are intentionally absent from Current/UI and must not turn
+    # an otherwise unchanged two-character layout into a cancellation.  The
+    # request already proved that every role changed by this permutation is in
+    # both layouts; the exact layout generation is therefore the authoritative
+    # pre-PREPARED roster check.
+    if observed_generation == transfer.layout_generation:
         return None
     return (
         int(transfer.sequence),
@@ -10371,16 +10420,6 @@ def install_p2_gauge_color(process):
     jump_site = GAUGE_COLOR_CAVE + len(cave)
     cave += b"\xe9" + rel32(jump_site, 5, GAUGE_COLOR_NONZERO_PATH)
 
-    process.write(
-        SIDE_GAUGE_PALETTE,
-        struct.pack("<8i", 57, 127, 85, 127, 57, 80, 127, 127),
-    )
-
-    process.write(
-        OTHER_GAUGE_PALETTE,
-        struct.pack("<8i", 22, 54, 46, 127, 88, 106, 40, 127),
-    )
-
     selection = menu_themes.load_selection()
     identity = session_state.SessionIdentity.from_config(session_state.load_config())
     role_themes = {
@@ -11401,6 +11440,56 @@ def guard_p3_publication_generation(process, desired_actor, owned):
     expected_actor = int(desired_actor) if owned else 0
     if published_actor != expected_actor:
         write_third_player_command(process, 0, 0.0, 0.0, False)
+
+
+def synchronize_second_player_legacy_movement_mirror(process, command):
+    """Mirror one committed P2 mailbox generation for legacy HUD consumers."""
+
+    active = bool(command.active and command.actor and command.phys)
+    actor = int(command.actor) if active else 0
+    phys = int(command.phys) if active else 0
+    current_actor = struct.unpack(
+        "<Q",
+        process.read(COMMAND_BLOCK + 0x10, 8),
+    )[0]
+    if current_actor != actor:
+        process.write(COMMAND_BLOCK + 0x10, struct.pack("<Q", 0))
+        process.write(COMMAND_BLOCK + 0x78, struct.pack("<Q", 0))
+    process.write(COMMAND_BLOCK + 0x00, struct.pack("<f", command.heading))
+    process.write(
+        COMMAND_BLOCK + 0x0C,
+        struct.pack("<f", command.visual_heading),
+    )
+    process.write(COMMAND_BLOCK + 0x04, struct.pack("<f", command.magnitude))
+    process.write(COMMAND_BLOCK + 0x78, struct.pack("<Q", phys))
+    process.write(COMMAND_BLOCK + 0x10, struct.pack("<Q", actor))
+
+
+def synchronize_third_player_legacy_movement_mirror(process, command):
+    """Mirror one committed P3 mailbox generation for legacy HUD consumers."""
+
+    block = third_player_block()
+    active = bool(command.active and command.actor and command.phys)
+    actor = int(command.actor) if active else 0
+    phys = int(command.phys) if active else 0
+    current_actor = struct.unpack(
+        "<Q",
+        process.read(block + P3_ACTOR_OFFSET, 8),
+    )[0]
+    if not active or current_actor != actor:
+        process.write(block + P3_MOVEMENT_ACTIVE_OFFSET, struct.pack("<I", 0))
+        process.write(block + P3_ACTOR_OFFSET, struct.pack("<Q", 0))
+        process.write(block + P3_PHYS_OFFSET, struct.pack("<Q", 0))
+    process.write(block + P3_HEADING_OFFSET, struct.pack("<f", command.heading))
+    process.write(block + P3_MAGNITUDE_OFFSET, struct.pack("<f", command.magnitude))
+    process.write(
+        block + P3_VISUAL_HEADING_OFFSET,
+        struct.pack("<f", command.visual_heading),
+    )
+    process.write(block + P3_PHYS_OFFSET, struct.pack("<Q", phys))
+    process.write(block + P3_ACTOR_OFFSET, struct.pack("<Q", actor))
+    if active:
+        process.write(block + P3_MOVEMENT_ACTIVE_OFFSET, struct.pack("<I", 1))
 
 
 def write_command(
@@ -12955,10 +13044,8 @@ def recover_native_leader_role_transfer_for_restart(
             "p3": movement_mailbox.publisher_for(process, P3_MOVEMENT_MAILBOX),
         }
         if transfer.native_applied:
-            for role in ("p2", "p3"):
-                sequence = getattr(transfer, f"{role}_movement_sequence")
-                if sequence and not publishers[role].adopt_committed(sequence):
-                    raise RuntimeError("applied leader journal is not observable")
+            if not settle_native_leader_role_transfer_publishers(process, transfer):
+                raise RuntimeError("applied leader journal is not observable")
             publish_native_leader_role_transfer_active(process, True)
             if (
                 process.u32(
@@ -14820,26 +14907,38 @@ def main():
                         session_snapshot.ui_layout,
                     )
                 )
-                ko_promoted_role = ko_leader_ownership.tick(
-                    process,
+                summon_owner_role = session_state.active_summon_owner_role(
                     session_snapshot.identity,
+                    session_snapshot.current_layout,
+                    session_snapshot.ui_layout,
                     native_leader_member_id,
-                    configured_p1_leader_available,
-                    p1_present=configured_p1_layout_coherent,
-                    p2_available=(
-                        p2_leader_available
-                        if p2_actor and p2_layout_coherent
-                        else False
-                    ),
-                    p3_available=(
-                        p3_leader_available
-                        if p3_actor and p3_layout_coherent
-                        else False
-                    ),
-                    now=now,
-                    transient_area_handoff=area_handoff.active,
-                    native_leader_is_known_guest=(native_leader_is_known_guest),
                 )
+                if summon_owner_role in ("p2", "p3"):
+                    # An Esper temporarily removes the other main actors from
+                    # Current/UI. The summoner keeps the same player role even
+                    # though that actor is also the native party leader.
+                    ko_promoted_role = summon_owner_role
+                else:
+                    ko_promoted_role = ko_leader_ownership.tick(
+                        process,
+                        session_snapshot.identity,
+                        native_leader_member_id,
+                        configured_p1_leader_available,
+                        p1_present=configured_p1_layout_coherent,
+                        p2_available=(
+                            p2_leader_available
+                            if p2_actor and p2_layout_coherent
+                            else False
+                        ),
+                        p3_available=(
+                            p3_leader_available
+                            if p3_actor and p3_layout_coherent
+                            else False
+                        ),
+                        now=now,
+                        transient_area_handoff=area_handoff.active,
+                        native_leader_is_known_guest=(native_leader_is_known_guest),
+                    )
                 logical_active, lifecycle_movement_active, shared_camera_active = (
                     coop_lifecycle_flags(
                         active,

@@ -240,6 +240,26 @@ def _advance_one(
             requested_sample=None,
             passive_deferral_observed=False,
         )
+    if (
+        observation is not None
+        and not observation.hard_cancel
+        and not observation.confirmed
+        and not observation.safe_to_request
+    ):
+        # A manual owner can be released while its previous native action pair
+        # is still settling. This is especially easy to hit with a rapid
+        # OFF/ON/OFF sequence: the second release replaces the first repair,
+        # then observes the transition left by the short reacquisition. There
+        # is nothing safe to write until the exact actor returns to the native
+        # idle/follower-list contract, so keep a write-free intent instead of
+        # letting a wall-clock deadline silently abandon the final OFF state.
+        # World, generation, layout and materialization checks above still
+        # retire stale identities before any later request can be emitted.
+        return replace(
+            repair,
+            deadline=max(repair.deadline, now + FOLLOW_REPAIR_DEADLINE_SECONDS),
+            passive_deferral_observed=True,
+        ), ()
     if now >= repair.deadline:
         passive_deferral = bool(
             observation is not None

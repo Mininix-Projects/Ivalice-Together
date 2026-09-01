@@ -451,6 +451,48 @@ class NativeCombatLogLayoutTests(unittest.TestCase):
     def test_target_info_backdrop_has_a_compact_lower_edge(self):
         self.assertEqual(live.TARGET_BACKDROP_BOTTOM_PADDING, 4)
 
+    def test_target_info_backdrop_idle_frame_uses_an_owned_clock(self):
+        class HiddenPanel:
+            def __init__(self):
+                self.hidden = False
+
+            def hide(self):
+                self.hidden = True
+
+        shell = live.CoopMenuRuntime.__new__(live.CoopMenuRuntime)
+        shell.target_info_backdrop_panel = HiddenPanel()
+        shell.target_info_backdrop_last_tick = 9.5
+        shell.target_info_backdrop_draw_key = (1, 1, 1, 1)
+        shell.target_info_backdrop_width = 100.0
+        shell.target_info_backdrop_height = 40.0
+        shell.p1_target_info_handle = 0
+        shell.p1_target_info_exit_started = 0.0
+        shell.p1_target_info_layout_x = 0
+        shell.p1_target_info_layout_y_offset = 0
+        shell.p1_target_info_last_target = None
+        shell.p1_target_info_started = 0.0
+        shell.p2_target_info_presented = False
+        shell.target_visual_exit_started = 0.0
+        shell.p2_target_info_layout_x = 0
+        shell.p2_target_info_layout_y_offset = 0
+        shell.target_visual_last_target = None
+        shell.target_visual_handle = 0
+        shell.target_visual_started = 0.0
+        shell.p3_target_info_handle = 0
+        shell.p3_target_info_exit_started = 0.0
+        shell.p3_target_info_layout_x = 0
+        shell.p3_target_info_layout_y_offset = 0
+        shell.p3_target_info_last_target = None
+        shell.p3_target_info_started = 0.0
+
+        shell.paint_target_info_backdrop(now=10.0)
+
+        self.assertTrue(shell.target_info_backdrop_panel.hidden)
+        self.assertEqual(shell.target_info_backdrop_last_tick, 10.0)
+        self.assertIsNone(shell.target_info_backdrop_draw_key)
+        self.assertEqual(shell.target_info_backdrop_width, 0.0)
+        self.assertEqual(shell.target_info_backdrop_height, 0.0)
+
     def test_native_authored_alpha_controls_combat_log_visibility(self):
         process = FakeVisibilityProcess(0)
         tracker = live.NativeCombatLogVisibility(process)

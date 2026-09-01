@@ -621,10 +621,18 @@ class RuntimeHotReinstallTests(unittest.TestCase):
                     self.assertEqual(process.patches, [])
 
         process = RuntimeImage()
-        self.assertEqual(self.install(process, upstream=True), "installed")
-        process.clear_activity()
-        self.assertEqual(self.install(process, upstream=True), "reused")
-        self.assertEqual(process.patches, [])
+        # This test validates the atomic install/reuse transaction, not the
+        # generated assembly template.  Keep it runnable from an asset-free
+        # source checkout where native build products are intentionally absent.
+        with mock.patch.object(
+            coop,
+            "_build_shared_camera_collision_filter",
+            return_value=b"\x90",
+        ):
+            self.assertEqual(self.install(process, upstream=True), "installed")
+            process.clear_activity()
+            self.assertEqual(self.install(process, upstream=True), "reused")
+            self.assertEqual(process.patches, [])
 
     def test_manifest_allocation_failure_leaves_uncommitted_runtime_fail_closed(self):
         process = RuntimeImage()

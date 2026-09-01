@@ -327,6 +327,71 @@ def active_main_party_members(layout: Sequence[int]) -> frozenset[int]:
     return frozenset(value for value in layout[:4] if value in MAIN_PARTY_MEMBER_IDS)
 
 
+def active_esper_party_member_id(
+    current_layout: Sequence[int],
+    ui_layout: Sequence[int],
+) -> int | None:
+    """Return the coherent temporary Esper materialized by both live layouts."""
+
+    current_espers = {
+        value for value in current_layout[:4] if value in ESPER_PARTY_MEMBER_IDS
+    }
+    ui_espers = {value for value in ui_layout[:4] if value in ESPER_PARTY_MEMBER_IDS}
+    if len(current_espers) != 1 or current_espers != ui_espers:
+        return None
+    return int(next(iter(current_espers)))
+
+
+def active_summon_owner_party_member_id(
+    identity: SessionIdentity,
+    current_layout: Sequence[int],
+    ui_layout: Sequence[int],
+    native_leader_member_id: int | None,
+) -> int | None:
+    """Resolve the main-party owner of a coherent temporary Esper formation."""
+
+    if active_esper_party_member_id(current_layout, ui_layout) is None:
+        return None
+    current_main = {
+        value for value in current_layout[:4] if value in MAIN_PARTY_MEMBER_IDS
+    }
+    ui_main = {value for value in ui_layout[:4] if value in MAIN_PARTY_MEMBER_IDS}
+    common_main = current_main & ui_main
+    assigned = {
+        identity.p1_party_member_id,
+        identity.p2_party_member_id,
+        identity.p3_party_member_id,
+    }
+    assigned.discard(None)
+    candidates = common_main & assigned
+    if native_leader_member_id in candidates:
+        return int(native_leader_member_id)
+    if len(candidates) == 1:
+        return int(next(iter(candidates)))
+    return None
+
+
+def active_summon_owner_role(
+    identity: SessionIdentity,
+    current_layout: Sequence[int],
+    ui_layout: Sequence[int],
+    native_leader_member_id: int | None,
+) -> str | None:
+    owner = active_summon_owner_party_member_id(
+        identity,
+        current_layout,
+        ui_layout,
+        native_leader_member_id,
+    )
+    if owner == identity.p1_party_member_id:
+        return "p1"
+    if owner == identity.p2_party_member_id:
+        return "p2"
+    if identity.p3_party_member_id is not None and owner == identity.p3_party_member_id:
+        return "p3"
+    return None
+
+
 @dataclass(frozen=True)
 class SessionSnapshot:
     identity: SessionIdentity
@@ -461,6 +526,13 @@ def with_solo_leader_ownership(snapshot: SessionSnapshot) -> SessionSnapshot:
 def replacement_identity_for_live_party(
     snapshot: SessionSnapshot,
 ) -> SessionIdentity | None:
+    if active_esper_party_member_id(
+        snapshot.current_layout,
+        snapshot.ui_layout,
+    ) is not None:
+        # Summoning temporarily dematerializes the other player actors. It is
+        # never a persistent party edit and must not rotate configured seats.
+        return None
     current_members = tuple(
         value for value in snapshot.current_layout[:4] if value != EMPTY_PARTY_ID
     )
@@ -604,6 +676,8 @@ def read_snapshot(
     chocobo_mode_active = False
     town = False
     structural_ready = False
+    summon_structural_ready = False
+    summon_owner_role: str | None = None
     reason = "loading: unavailable live structures"
 
     try:
@@ -661,9 +735,36 @@ def read_snapshot(
             and ui_location != 0xFFFFFFFF
             and current_location == ui_location
         )
+        summon_owner_role = active_summon_owner_role(
+            identity,
+            current_layout,
+            ui_layout,
+            leader,
+        )
+        summon_owner_member_id = active_summon_owner_party_member_id(
+            identity,
+            current_layout,
+            ui_layout,
+            leader,
+        )
+        summon_actor_present = bool(
+            materialized_party_count is None or materialized_party_count >= 1
+        )
+        summon_structural_ready = bool(
+            summon_owner_role is not None
+            and summon_owner_member_id in current_members
+            and summon_owner_member_id in ui_members
+            and summon_actor_present
+            and location_coherent
+        )
         p1_structural_ready = p1_role_present and p1_actor_present and location_coherent
-        structural_ready = p1_structural_ready and roles_present and actors_present
-        if not p1_role_present:
+        structural_ready = bool(
+            (p1_structural_ready and roles_present and actors_present)
+            or summon_structural_ready
+        )
+        if summon_structural_ready:
+            reason = f"field: active summon owned by {summon_owner_role.upper()}"
+        elif not p1_role_present:
             reason = "loading: controlled P1 is not in Current/UI party"
         elif not p1_actor_present:
             reason = "loading: P1 actor is not materialized"
@@ -677,14 +778,16 @@ def read_snapshot(
         p1_structural_ready = False
         structural_ready = False
 
-    loading = not p1_structural_ready
+    loading = not (p1_structural_ready or summon_structural_ready)
     cutscene = bool(
         p1_structural_ready
         and not control_enabled
         and not native_menu_open
         and not native_modal_active
     )
-    p1_gameplay_ready = bool(p1_structural_ready and not loading)
+    p1_gameplay_ready = bool(
+        (p1_structural_ready or summon_owner_role == "p1") and not loading
+    )
     gameplay_ready = bool(structural_ready and not loading)
     p1_is_leader = leader == p1_controlled_party_member_id(
         identity, current_layout, ui_layout, leader
@@ -702,6 +805,8 @@ def read_snapshot(
             reason = "chocobo"
         elif cutscene:
             reason = "cutscene/dialogue control lock"
+        elif summon_owner_role is not None:
+            reason = f"field: active summon owned by {summon_owner_role.upper()}"
         elif not p1_is_leader:
             reason = "P1 is not the party leader"
 
@@ -712,6 +817,7 @@ def read_snapshot(
         and not native_modal_active
         and not town
         and p1_is_leader
+        and summon_owner_role in (None, "p1")
         and not chocobo_mode_active
     )
     p2_menu_allowed = bool(
@@ -720,6 +826,7 @@ def read_snapshot(
         and not native_menu_open
         and not native_modal_active
         and not town
+        and summon_owner_role in (None, "p2")
         and not chocobo_mode_active
     )
     return SessionSnapshot(

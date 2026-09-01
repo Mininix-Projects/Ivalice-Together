@@ -592,7 +592,7 @@ class FollowHandoffPolicyTests(unittest.TestCase):
                 self.assertEqual(state.repairs[0].attempts, 0)
                 self.assertEqual(effects, ())
 
-    def test_protected_action_expires_only_at_the_bounded_deadline(self):
+    def test_protected_action_keeps_a_write_free_release_intent(self):
         owner = token("p2", 5, 0x10000)
         repair = handoff.FollowRepair(owner, 0.0, 1.0)
         protected = observation(owner, action=0x4999, target=0x1234)
@@ -603,7 +603,10 @@ class FollowHandoffPolicyTests(unittest.TestCase):
             now=0.999,
             world_epoch=1,
         )
-        self.assertEqual(state.repairs, (repair,))
+        self.assertEqual(len(state.repairs), 1)
+        self.assertEqual(state.repairs[0].attempts, 0)
+        self.assertEqual(state.repairs[0].deadline, 1.999)
+        self.assertTrue(state.repairs[0].passive_deferral_observed)
         self.assertEqual(effects, ())
 
         state, effects = handoff.advance_repairs(
@@ -612,10 +615,155 @@ class FollowHandoffPolicyTests(unittest.TestCase):
             now=1.0,
             world_epoch=1,
         )
-        self.assertEqual(state.repairs, ())
-        self.assertEqual(len(effects), 1)
-        self.assertEqual(effects[0].kind, handoff.EffectKind.CANCEL_NATIVE_FOLLOW)
-        self.assertEqual(effects[0].reason, "bounded")
+        self.assertEqual(len(state.repairs), 1)
+        self.assertEqual(state.repairs[0].attempts, 0)
+        self.assertEqual(state.repairs[0].deadline, 2.0)
+        self.assertTrue(state.repairs[0].passive_deferral_observed)
+        self.assertEqual(effects, ())
+
+    def test_rapid_disable_enable_disable_converges_after_action_settles(self):
+        for role, member, actor in (
+            ("p2", 5, 0x10000),
+            ("p3", 1, 0x20000),
+        ):
+            with self.subTest(role=role):
+                owner = token(role, member, actor)
+                protected = observation(
+                    owner,
+                    sample=1,
+                    action_state=2,
+                    target=0x1234,
+                    action=0x4999,
+                    descriptor_action=0x4888,
+                    follows_native_list=False,
+                )
+                state = handoff.HandoffState(((role, owner),), ())
+
+                # First OFF creates a release intent.
+                state, effects = handoff.reconcile_owners(
+                    state,
+                    {role: None},
+                    acquire_eligible={role: False},
+                    observations={owner.incarnation_key: protected},
+                    now=0.0,
+                    world_epoch=1,
+                )
+                self.assertEqual(
+                    tuple(effect.kind for effect in effects),
+                    (
+                        handoff.EffectKind.DISARM_OLD,
+                        handoff.EffectKind.CLEAR_OLD_METADATA,
+                    ),
+                )
+
+                # ON cancels that exact pending release and reacquires it.
+                state, effects = handoff.reconcile_owners(
+                    state,
+                    {role: owner},
+                    acquire_eligible={role: True},
+                    observations={owner.incarnation_key: protected},
+                    now=0.01,
+                    world_epoch=1,
+                )
+                self.assertEqual(state.repairs, ())
+                self.assertEqual(
+                    tuple(effect.kind for effect in effects),
+                    (handoff.EffectKind.ACQUIRE_NEW,),
+                )
+
+                # Final OFF must remain authoritative even if reacquisition
+                # leaves an incompatible action visible past the old deadline.
+                state, _effects = handoff.reconcile_owners(
+                    state,
+                    {role: None},
+                    acquire_eligible={role: False},
+                    observations={owner.incarnation_key: protected},
+                    now=0.02,
+                    world_epoch=1,
+                )
+                state, effects = handoff.advance_repairs(
+                    state,
+                    {owner.incarnation_key: protected},
+                    now=5.0,
+                    world_epoch=1,
+                )
+                self.assertEqual(effects, ())
+                self.assertEqual(len(state.repairs), 1)
+                self.assertEqual(state.repairs[0].attempts, 0)
+
+                safe = observation(owner, sample=2)
+                state, effects = handoff.advance_repairs(
+                    state,
+                    {owner.incarnation_key: safe},
+                    now=5.1,
+                    world_epoch=1,
+                )
+                self.assertEqual(
+                    tuple(effect.kind for effect in effects),
+                    (handoff.EffectKind.REQUEST_NATIVE_FOLLOW,),
+                )
+
+                followed = observation(
+                    owner,
+                    sample=3,
+                    action=handoff.FOLLOW_ACTION,
+                )
+                state, effects = handoff.advance_repairs(
+                    state,
+                    {owner.incarnation_key: followed},
+                    now=5.11,
+                    world_epoch=1,
+                )
+                self.assertEqual(state.repairs, ())
+                self.assertEqual(
+                    tuple(effect.kind for effect in effects),
+                    (handoff.EffectKind.CONFIRM_NATIVE_FOLLOW,),
+                )
+
+    def test_requested_release_survives_a_later_incompatible_action(self):
+        owner = token("p2", 5, 0x10000)
+        repair = handoff.FollowRepair(
+            owner,
+            created_at=0.0,
+            deadline=1.0,
+            attempts=1,
+            next_attempt_at=0.1,
+            requested_sample=1,
+        )
+        protected = observation(
+            owner,
+            sample=2,
+            action_state=2,
+            target=0x1234,
+            action=0x4999,
+            descriptor_action=0x4888,
+            follows_native_list=False,
+        )
+
+        state, effects = handoff.advance_repairs(
+            handoff.HandoffState((), (repair,)),
+            {owner.incarnation_key: protected},
+            now=5.0,
+            world_epoch=1,
+        )
+        self.assertEqual(effects, ())
+        self.assertEqual(len(state.repairs), 1)
+        self.assertEqual(state.repairs[0].attempts, 1)
+        self.assertEqual(state.repairs[0].deadline, 6.0)
+        self.assertTrue(state.repairs[0].passive_deferral_observed)
+
+        state, effects = handoff.advance_repairs(
+            state,
+            {owner.incarnation_key: observation(owner, sample=3)},
+            now=5.1,
+            world_epoch=1,
+        )
+        self.assertEqual(
+            tuple(effect.kind for effect in effects),
+            (handoff.EffectKind.REQUEST_NATIVE_FOLLOW,),
+        )
+        self.assertEqual(state.repairs[0].attempts, 1)
+        self.assertEqual(state.repairs[0].requested_sample, 3)
 
     def test_unknown_alive_or_leader_state_waits_without_an_unsafe_request(self):
         for changes in (dict(alive=None), dict(leader_member_id=None)):

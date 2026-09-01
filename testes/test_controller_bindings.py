@@ -1676,6 +1676,40 @@ def test_menu_hold_repeat_starts_after_one_quarter_second():
     assert controls.INITIAL_REPEAT_DELAY == 0.250
 
 
+def test_triangle_fast_scroll_uses_a_shorter_repeat_window(tmp_path: Path):
+    path = tmp_path / "controller_config.json"
+    controls.save_config(controls.default_config(), path)
+    poller = controls.BindingPoller(path)
+    poller._event_strength = mock.Mock(return_value=1.0)
+
+    with mock.patch.object(controls.time, "monotonic", return_value=10.0):
+        assert poller.repeat("p1", "menu_down", accelerated=True)
+    assert poller._next_repeat[("p1", "menu_down")] == 10.1
+
+    with mock.patch.object(controls.time, "monotonic", return_value=10.101):
+        assert poller.repeat("p1", "menu_down", accelerated=True)
+    assert math.isclose(
+        poller._next_repeat[("p1", "menu_down")],
+        10.136,
+        abs_tol=1e-12,
+    )
+
+
+def test_enabling_fast_scroll_caps_an_existing_slow_repeat_timer(tmp_path: Path):
+    path = tmp_path / "controller_config.json"
+    controls.save_config(controls.default_config(), path)
+    poller = controls.BindingPoller(path)
+    poller._event_strength = mock.Mock(return_value=1.0)
+
+    with mock.patch.object(controls.time, "monotonic", return_value=20.0):
+        assert poller.repeat("p2", "menu_up")
+    assert poller._next_repeat[("p2", "menu_up")] == 20.25
+
+    with mock.patch.object(controls.time, "monotonic", return_value=20.05):
+        assert not poller.repeat("p2", "menu_up", accelerated=True)
+    assert poller._next_repeat[("p2", "menu_up")] == 20.085
+
+
 def test_physical_dpad_edge_has_independent_history(tmp_path: Path):
     path = tmp_path / "controller_config.json"
     config = controls.default_config()

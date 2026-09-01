@@ -626,11 +626,8 @@ class CoopLifecycleTests(unittest.TestCase):
             "configured_p1_leader_available = actor_available_for_native_leader(",
             source,
         )
-        self.assertIn(
-            "configured_p1_leader_available,\n"
-            "                    p1_present=configured_p1_layout_coherent,",
-            source,
-        )
+        self.assertIn("configured_p1_leader_available,", source)
+        self.assertIn("p1_present=configured_p1_layout_coherent,", source)
         self.assertNotIn("configured_p1_alive = actor_is_alive", source)
 
     def test_torn_ko_replacement_sample_stays_unknown(self):

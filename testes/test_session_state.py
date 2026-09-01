@@ -73,6 +73,33 @@ class ActiveMainPartyMemberTests(unittest.TestCase):
         layout = (5, 3, state.EMPTY_PARTY_ID, 11) + (state.EMPTY_PARTY_ID,) * 5
         self.assertEqual(state.active_main_party_members(layout), frozenset((5, 3)))
 
+    def test_summon_owner_role_is_the_assigned_summoner_not_p1(self):
+        identity = state.SessionIdentity(0, 5, 1)
+        layout = (5, state.EMPTY_PARTY_ID, state.EMPTY_PARTY_ID, 27) + (
+            state.EMPTY_PARTY_ID,
+        ) * 5
+
+        self.assertEqual(state.active_esper_party_member_id(layout, layout), 27)
+        self.assertEqual(
+            state.active_summon_owner_party_member_id(identity, layout, layout, 5),
+            5,
+        )
+        self.assertEqual(
+            state.active_summon_owner_role(identity, layout, layout, 5),
+            "p2",
+        )
+
+    def test_torn_esper_layout_never_claims_summon_ownership(self):
+        identity = state.SessionIdentity(0, 5, 1)
+        current = (5, state.EMPTY_PARTY_ID, state.EMPTY_PARTY_ID, 27) + (
+            state.EMPTY_PARTY_ID,
+        ) * 5
+        ui = (5, state.EMPTY_PARTY_ID, state.EMPTY_PARTY_ID, 28) + (
+            state.EMPTY_PARTY_ID,
+        ) * 5
+
+        self.assertIsNone(state.active_summon_owner_role(identity, current, ui, 5))
+
 
 def ready_process(
     *,
@@ -133,6 +160,40 @@ def ready_process(
 
 
 class SessionStateTests(unittest.TestCase):
+    def test_p2_summon_is_a_ready_world_owned_only_by_p2(self):
+        process = ready_process(leader=5)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        summon_layout = struct.pack(
+            "<9H",
+            5,
+            state.EMPTY_PARTY_ID,
+            state.EMPTY_PARTY_ID,
+            27,
+            *([state.EMPTY_PARTY_ID] * 5),
+        )
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                summon_layout,
+            )
+
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(0, 5, 1),
+            materialized_party_count=2,
+        )
+
+        self.assertFalse(snapshot.loading)
+        self.assertTrue(snapshot.gameplay_ready)
+        self.assertFalse(snapshot.p1_gameplay_ready)
+        self.assertFalse(snapshot.p1_menu_allowed)
+        self.assertTrue(snapshot.p2_menu_allowed)
+        self.assertTrue(snapshot.movement_allowed)
+        self.assertIn("active summon owned by P2", snapshot.reason)
+        self.assertIsNone(state.replacement_identity_for_live_party(snapshot))
+
     def test_role_reconciliation_is_exhaustive_for_native_slot_classes(self):
         empty = state.EMPTY_PARTY_ID
         checked = 0
@@ -183,6 +244,22 @@ class SessionStateTests(unittest.TestCase):
                                 )
                             )
                             self.assertEqual(len(roles), len(set(roles)))
+                            if (
+                                configured.p2_party_member_id in live
+                                and leader != configured.p2_party_member_id
+                            ):
+                                self.assertEqual(
+                                    effective.p2_party_member_id,
+                                    configured.p2_party_member_id,
+                                )
+                            if (
+                                configured.p3_party_member_id in live
+                                and leader != configured.p3_party_member_id
+                            ):
+                                self.assertEqual(
+                                    effective.p3_party_member_id,
+                                    configured.p3_party_member_id,
+                                )
                             if live_count < 3:
                                 self.assertIsNotNone(effective.p3_party_member_id)
                             checked += 1
@@ -654,6 +731,34 @@ class SessionStateTests(unittest.TestCase):
         self.assertTrue(snapshot.p1_is_leader)
         self.assertTrue(snapshot.p1_menu_allowed)
 
+    def test_reks_only_prologue_is_a_ready_transient_p1_generation(self):
+        process = ready_process(leader=6)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        reks_only = struct.pack(
+            "<9H", 6, *([state.EMPTY_PARTY_ID] * 8)
+        )
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                reks_only,
+            )
+
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(0, 5, 1),
+            materialized_party_count=1,
+        )
+
+        self.assertEqual(snapshot.p1_owner_party_member_id, 6)
+        self.assertEqual(snapshot.p1_reserved_party_member_id, 0)
+        self.assertEqual(snapshot.identity, state.SessionIdentity(0, 5, 1))
+        self.assertTrue(snapshot.p1_gameplay_ready)
+        self.assertTrue(snapshot.p1_is_leader)
+        self.assertTrue(snapshot.p1_menu_allowed)
+        self.assertTrue(snapshot.bridge_ownership_allowed)
+
     def test_esper_can_never_become_transient_p1(self):
         identity = state.SessionIdentity(0, 5, 1)
         layout = (0, 5, 33, *([state.EMPTY_PARTY_ID] * 6))
@@ -751,6 +856,68 @@ class SessionStateTests(unittest.TestCase):
         )
         replacement = state.replacement_identity_for_live_party(snapshot)
         self.assertEqual(replacement, state.SessionIdentity(4, 1))
+
+    def test_two_slot_party_edit_keeps_the_active_p3_character_in_p3(self):
+        process = ready_process(leader=0)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        layout = struct.pack("<9H", 0, 4, *([state.EMPTY_PARTY_ID] * 7))
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                layout,
+            )
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(5, 1, 4),
+            materialized_party_count=2,
+        )
+
+        replacement = state.replacement_identity_for_live_party(snapshot)
+
+        self.assertEqual(replacement, state.SessionIdentity(0, 1, 4))
+
+    def test_removing_p2_does_not_promote_the_active_p3_character(self):
+        process = ready_process(leader=5)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        layout = struct.pack("<9H", 5, 4, *([state.EMPTY_PARTY_ID] * 7))
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                layout,
+            )
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(5, 3, 4),
+            materialized_party_count=2,
+        )
+
+        self.assertIsNone(state.replacement_identity_for_live_party(snapshot))
+
+    def test_replacing_p2_preserves_the_active_p3_character(self):
+        process = ready_process(leader=5)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        layout = struct.pack("<9H", 5, 0, 4, *([state.EMPTY_PARTY_ID] * 6))
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                layout,
+            )
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(5, 3, 4),
+            materialized_party_count=3,
+        )
+
+        self.assertEqual(
+            state.replacement_identity_for_live_party(snapshot),
+            state.SessionIdentity(5, 0, 4),
+        )
 
     def test_live_party_replacement_follows_new_leader_when_p1_is_absent(self):
         process = ready_process(leader=5)

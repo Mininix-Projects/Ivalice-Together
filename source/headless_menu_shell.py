@@ -125,6 +125,14 @@ PendingCombatIndicator = menu_runtime_state.PendingCombatIndicator
 PlayerMenuInput = menu_runtime_state.PlayerMenuInput
 WorldInteractions = menu_runtime_state.WorldInteractions
 
+
+def vertical_input_command(direction: int, fresh_edge: bool | None) -> InputCommand:
+    """Wrap only a new directional press; held repeats stop at list boundaries."""
+
+    if int(direction) < 0:
+        return InputCommand.UP if fresh_edge is not False else InputCommand.UP_REPEAT
+    return InputCommand.DOWN if fresh_edge is not False else InputCommand.DOWN_REPEAT
+
 CAMERA_PROJECTION_MATRIX = 0x2CB84B0
 INPROCESS_RING_READY_OFFSET = 0xD80
 INPROCESS_RING_READY_MAGIC = 0x33474E52
@@ -248,6 +256,8 @@ def coop_runtime_enabled(process, *, fallback: bool = True) -> bool:
 
 NATIVE_PAUSE_PRIMARY_OBJECT = 0x0209AD28
 NATIVE_PAUSE_SECONDARY_OBJECT = 0x0209AD30
+NATIVE_PAUSE_POINTER_DROPOUT_SECONDS = 0.30
+NATIVE_PAUSE_FOCUS_RESUME_SECONDS = 0.50
 
 
 NATIVE_RENDERING_FLAGS = 0x022C7F90
@@ -326,6 +336,7 @@ NATIVE_MENU_SETTLE_SECONDS = 0.25
 NATIVE_PARTY_MENU_TRANSFER_TIMEOUT_SECONDS = 1.25
 NATIVE_FRONTEND_CLOSE_SETTLE_SECONDS = 0.20
 NATIVE_FRONTEND_OPEN_SETTLE_SECONDS = 0.04
+UNEXPECTED_NATIVE_COMMAND_CANCEL_RETRY_SECONDS = 0.20
 
 
 P1_FRONTEND_DEFERRED_OPEN_SECONDS = 0.75
@@ -992,10 +1003,20 @@ def p1_menu_input_owned(mode: MenuMode, transition_kind: str | None) -> bool:
     return bool(mode is not MenuMode.CLOSED or transition_kind is not None)
 
 
-def p1_menu_owns_lb(mode: MenuMode) -> bool:
-    """Reserve LB only while P1's custom menu is logically open."""
+def p1_menu_owns_lb(
+    mode: MenuMode,
+    *,
+    directional_owner: bool | None = None,
+    leader_selector_active: bool = False,
+) -> bool:
+    """Reserve P1 LB except while the custom Leader selector needs Turbo."""
 
-    return mode is not MenuMode.CLOSED
+    lifecycle_owned = (
+        mode is not MenuMode.CLOSED
+        if directional_owner is None
+        else bool(directional_owner)
+    )
+    return bool(lifecycle_owned and not leader_selector_active)
 
 
 @dataclass
@@ -1020,6 +1041,59 @@ class DirectionalReleaseGuard:
 
             self.blocked_until = max(self.blocked_until, now + self.delay_seconds)
         return bool(self.requires_release or now < self.blocked_until)
+
+
+@dataclass
+class NativePauseVisibilityGate:
+    """Keep custom input suspended across transient Pause pointer gaps."""
+
+    pointer_dropout_seconds: float = NATIVE_PAUSE_POINTER_DROPOUT_SECONDS
+    focus_resume_seconds: float = NATIVE_PAUSE_FOCUS_RESUME_SECONDS
+    latched: bool = False
+    last_confirmed_at: float = float("-inf")
+    focus_guard_until: float = 0.0
+    previous_foreground: bool | None = None
+
+    def arm(self, *, now: float, foreground: bool) -> None:
+        """Cover the interval between an accepted Pause edge and its object."""
+
+        now = float(now)
+        self.latched = True
+        self.last_confirmed_at = now
+        self.previous_foreground = bool(foreground)
+
+    def update(self, raw_open: bool, *, foreground: bool, now: float) -> bool:
+        now = float(now)
+        foreground = bool(foreground)
+        focus_resumed = bool(
+            foreground and self.previous_foreground is False
+        )
+        self.previous_foreground = foreground
+
+        if raw_open:
+            self.latched = True
+            self.last_confirmed_at = now
+        if not self.latched:
+            return False
+        if not foreground:
+            return True
+        if focus_resumed:
+            self.focus_guard_until = max(
+                self.focus_guard_until,
+                now + self.focus_resume_seconds,
+            )
+        if raw_open:
+            return True
+
+        guarded_until = max(
+            self.last_confirmed_at + self.pointer_dropout_seconds,
+            self.focus_guard_until,
+        )
+        if now < guarded_until:
+            return True
+        self.latched = False
+        self.focus_guard_until = 0.0
+        return False
 
 
 def custom_directional_control_down(bindings) -> bool:
@@ -1148,8 +1222,32 @@ def p3_session_menu_allowed(
     snapshot: session_state.SessionSnapshot,
     party_count: int,
 ) -> bool:
+    current_layout = getattr(snapshot, "current_layout", ())
+    ui_layout = getattr(snapshot, "ui_layout", ())
+    summon_owner_role = (
+        session_state.active_summon_owner_role(
+            snapshot.identity,
+            current_layout,
+            ui_layout,
+            getattr(snapshot, "leader_party_member_id", None),
+        )
+        if current_layout and ui_layout
+        else None
+    )
+    if summon_owner_role == "p3":
+        return bool(
+            snapshot.gameplay_ready
+            and snapshot.user_control_enabled
+            and not snapshot.native_menu_open
+            and not snapshot.native_modal_active
+            and not snapshot.town
+            and not snapshot.chocobo_mode_active
+            and snapshot.identity.p3_party_member_id is not None
+            and int(party_count) >= 1
+        )
     return bool(
         snapshot.p2_menu_allowed
+        and summon_owner_role is None
         and snapshot.identity.p3_party_member_id is not None
         and int(party_count) >= 3
     )
@@ -1188,11 +1286,25 @@ def model_target_content_rows(model: P2MenuModel) -> int:
 
 def coop_character_role_candidate(
     member_id: int,
-    p1_member_id: int,
+    p1_owner_member_id: int,
+    p1_reserved_member_id: int | None = None,
 ) -> bool:
+    member_id = int(member_id)
+    p1_owner_member_id = int(p1_owner_member_id)
+    p1_reserved_member_id = (
+        p1_owner_member_id
+        if p1_reserved_member_id is None
+        else int(p1_reserved_member_id)
+    )
+    if member_id not in session_state.MAIN_PARTY_MEMBER_IDS:
+        return False
+    # A stable P1 role is a valid exchange target: selecting it from P2/P3
+    # atomically swaps both owners through the native leader transaction.  A
+    # temporary KO/summon override must settle before either P1 identity can
+    # participate, otherwise two roles could briefly claim the same actor.
     return bool(
-        int(member_id) in session_state.MAIN_PARTY_MEMBER_IDS
-        and int(member_id) != int(p1_member_id)
+        p1_owner_member_id == p1_reserved_member_id
+        or member_id not in (p1_owner_member_id, p1_reserved_member_id)
     )
 
 
@@ -1261,6 +1373,32 @@ def native_party_recovery_required(
 
     states = tuple(active_actor_alive)
     return bool(states) and all(state is False for state in states)
+
+
+def native_party_recovery_passthrough_required(
+    active_actor_alive: tuple[bool | None, ...],
+    *,
+    latched: bool,
+    native_menu_observed: bool,
+    native_menu_open: bool,
+    native_frontend_suspended: bool,
+    suspension_source: str,
+) -> bool:
+    """Keep native input ownership until the forced recovery menu truly closes."""
+
+    if native_party_recovery_required(active_actor_alive):
+        return True
+    if not latched:
+        return False
+    if not native_menu_observed:
+        return True
+    return bool(
+        native_menu_open
+        or (
+            native_frontend_suspended
+            and suspension_source == "dead_party_recovery"
+        )
+    )
 
 
 def native_party_menu_source_allowed(
@@ -1827,6 +1965,7 @@ NATIVE_INPUT_COMMAND_MASK = native_semantic_mask(NATIVE_DIALOG_COMMAND)
 NATIVE_INPUT_CONFIRM_MASK = native_semantic_mask(NATIVE_DIALOG_CONFIRM)
 NATIVE_INPUT_PARTY_MASK = native_semantic_mask(NATIVE_DIALOG_PARTY_MENU)
 NATIVE_INPUT_LB_MASK = native_semantic_mask(NATIVE_DIALOG_LB)
+NATIVE_INPUT_RB_MASK = native_semantic_mask(NATIVE_DIALOG_RB)
 NATIVE_INPUT_DIRECTION_MASK = native_semantic_mask(
     NATIVE_DIALOG_UP,
     NATIVE_DIALOG_RIGHT,
@@ -1846,6 +1985,9 @@ NATIVE_INPUT_CUSTOM_DIRECTION_MASK = native_semantic_mask(
     NATIVE_DIALOG_RIGHT,
     NATIVE_DIALOG_DOWN,
     NATIVE_DIALOG_LEFT,
+)
+NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK = (
+    NATIVE_INPUT_DIRECTION_MASK | NATIVE_INPUT_RB_MASK
 )
 
 
@@ -1906,7 +2048,10 @@ def native_input_policy(
     if capture_desktop_events:
         other_mask |= NATIVE_INPUT_COMMAND_MASK
     if custom_directional_owner:
-        p1_mask |= NATIVE_INPUT_CUSTOM_DIRECTION_MASK
+        # P1 LB is a separate policy contribution so the custom Leader selector
+        # can leave the game's Turbo semantic native without releasing RB or
+        # any d-pad direction. Followers still own the complete navigation set.
+        p1_mask |= NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK
         other_mask |= NATIVE_INPUT_CUSTOM_DIRECTION_MASK
     if leader_replacement:
         p1_mask |= NATIVE_INPUT_LEADER_MASK
@@ -3868,8 +4013,8 @@ class NativeDialogInputBridge:
             p1_mask & p1_replacement_mask == p1_replacement_mask
         )
         self.custom_directional_owner = bool(
-            p1_mask & NATIVE_INPUT_CUSTOM_DIRECTION_MASK
-            == NATIVE_INPUT_CUSTOM_DIRECTION_MASK
+            p1_mask & NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK
+            == NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK
             and other_mask & NATIVE_INPUT_CUSTOM_DIRECTION_MASK
             == NATIVE_INPUT_CUSTOM_DIRECTION_MASK
         )
@@ -6432,6 +6577,7 @@ class CoopMenuRuntime:
         self.last_runtime_catalog_shared_refresh = 0.0
         self.p1_visual_replacement = True
         self.p1_pause_suspended = False
+        self.native_pause_visibility_gate = NativePauseVisibilityGate()
 
         self.p1_active_lifecycle: tuple[int, int] | None = None
         self.p1_transition_kind: str | None = None
@@ -6510,6 +6656,7 @@ class CoopMenuRuntime:
         self.p1_leader_handoff_member_id: int | None = None
         self.p1_leader_handoff_deadline = 0.0
         self.p1_leader_handoff_identity: session_state.SessionIdentity | None = None
+        self.live_role_identity_override: session_state.SessionIdentity | None = None
         self.p1_leader_handoff_identity_saved = False
         self.p1_leader_handoff_save_retry_at = 0.0
         self.native_desktop_capture_owner: str | None = None
@@ -6529,8 +6676,10 @@ class CoopMenuRuntime:
         self.native_frontend_suspended_battle_info = 0
         self.native_frontend_suspended_role_generation = 0
         self.unexpected_native_menu_cancel_latched = False
+        self.unexpected_native_menu_cancel_retry_at = 0.0
         self.native_party_menu_active = False
         self.native_dead_party_recovery_passthrough = False
+        self.native_dead_party_recovery_observed_open = False
         self.native_party_menu_request_pending = False
         self.native_party_menu_request_pulsed = False
         self.native_party_menu_request_source = ""
@@ -6894,7 +7043,7 @@ class CoopMenuRuntime:
     def follower_prompt_scan_candidates(self) -> dict[int, tuple[int, int]]:
         candidates: dict[int, tuple[int, int]] = {}
         try:
-            if len(self.party) >= 2:
+            if len(self.party) >= 2 and self.party[1][2]:
                 candidates[2] = (
                     int(self.party[1][2]),
                     self.process.u32(
@@ -6902,7 +7051,7 @@ class CoopMenuRuntime:
                         + legacy.coop.P2_LOOT_HANDLE_OFFSET
                     ),
                 )
-            if len(self.party) >= 3:
+            if len(self.party) >= 3 and self.party[2][2]:
                 block = legacy.coop.third_player_block()
                 candidates[3] = (
                     int(self.party[2][2]),
@@ -7478,34 +7627,56 @@ class CoopMenuRuntime:
                 )
                 else None
             )
-            party = []
-            if p1_entry is not None:
-                entry = p1_entry
-                actor = entry[1]
-                handle = self.process.u32(actor + 0x08)
-                if handle:
-                    party.append(
-                        (
-                            session_state.PARTY_NAMES.get(
-                                p1_owner_member_id,
-                                f"Party {p1_owner_member_id}",
-                            ),
-                            handle,
-                            actor,
-                        )
-                    )
+            summon_owner_role = session_state.active_summon_owner_role(
+                snapshot.identity,
+                snapshot.current_layout,
+                snapshot.ui_layout,
+                getattr(snapshot, "leader_party_member_id", None),
+            )
 
-            if party and p2_entry is not None:
-                entry = p2_entry
+            def role_entry(entry, name):
+                if entry is None:
+                    return (name, 0, 0)
                 actor = entry[1]
                 handle = self.process.u32(actor + 0x08)
-                if handle:
-                    party.append((snapshot.identity.name("p2"), handle, actor))
-            if len(party) >= 2 and p3_entry is not None:
-                actor = p3_entry[1]
-                handle = self.process.u32(actor + 0x08)
-                if handle:
-                    party.append((snapshot.identity.name("p3"), handle, actor))
+                return (name, handle, actor) if handle else (name, 0, 0)
+
+            if summon_owner_role is not None:
+                # Keep player indices stable while the native summon formation
+                # materializes only its owner and Esper. Compacting P2/P3 into
+                # index zero would route their input through P1.
+                party = [
+                    role_entry(
+                        p1_entry,
+                        session_state.PARTY_NAMES.get(
+                            p1_owner_member_id,
+                            f"Party {p1_owner_member_id}",
+                        ),
+                    ),
+                    role_entry(p2_entry, snapshot.identity.name("p2")),
+                ]
+                if snapshot.identity.p3_party_member_id is not None:
+                    party.append(role_entry(p3_entry, snapshot.identity.name("p3")))
+            else:
+                party = []
+                if p1_entry is not None:
+                    candidate = role_entry(
+                        p1_entry,
+                        session_state.PARTY_NAMES.get(
+                            p1_owner_member_id,
+                            f"Party {p1_owner_member_id}",
+                        ),
+                    )
+                    if candidate[1]:
+                        party.append(candidate)
+                if party and p2_entry is not None:
+                    candidate = role_entry(p2_entry, snapshot.identity.name("p2"))
+                    if candidate[1]:
+                        party.append(candidate)
+                if len(party) >= 2 and p3_entry is not None:
+                    candidate = role_entry(p3_entry, snapshot.identity.name("p3"))
+                    if candidate[1]:
+                        party.append(candidate)
             if self._actor_topology_sample_regressed(snapshot, active_party):
                 # resolve_active_actors() deliberately skips an entry whose
                 # individual pointer sample tears.  Without a generation fence
@@ -7616,6 +7787,23 @@ class CoopMenuRuntime:
             self.process,
             materialized_party_count=self.materialized_party_count,
         )
+        state_now = time.monotonic()
+        summon_active, summon_owner_member_id = self.resolve_summon_ownership(
+            snapshot.current_layout,
+            snapshot.leader_party_member_id,
+            now=state_now,
+        )
+        summon_owner_role = None
+        if summon_owner_member_id == snapshot.identity.p1_party_member_id:
+            summon_owner_role = "p1"
+        elif summon_owner_member_id == snapshot.identity.p2_party_member_id:
+            summon_owner_role = "p2"
+        elif (
+            snapshot.identity.p3_party_member_id is not None
+            and summon_owner_member_id == snapshot.identity.p3_party_member_id
+        ):
+            summon_owner_role = "p3"
+        self.summon_owner_role = summon_owner_role
         if not int(getattr(self, "p1_leader_handoff_sequence", 0)):
             try:
                 legacy.coop.acknowledge_native_leader_role_cancellation(
@@ -7641,6 +7829,9 @@ class CoopMenuRuntime:
             snapshot,
             role_transfer,
         )
+        live_override = getattr(self, "live_role_identity_override", None)
+        if live_override is not None and snapshot.identity == live_override:
+            self.live_role_identity_override = None
         owns_native_presentation = (
             self.native_wait_mode_bridge.owns_native_presentation()
         )
@@ -7693,12 +7884,16 @@ class CoopMenuRuntime:
             snapshot.identity.p1_party_member_id in snapshot.current_layout[:4]
             and snapshot.identity.p1_party_member_id in snapshot.ui_layout[:4]
         )
-        ko_promoted_role = ko_promoted_role_for_availability(
-            snapshot.identity,
-            snapshot.leader_party_member_id,
-            configured_p1_available,
-            p1_present=p1_present,
-            previous_role=getattr(self, "ko_promoted_follower_role", None),
+        ko_promoted_role = (
+            summon_owner_role
+            if summon_owner_role in ("p2", "p3")
+            else ko_promoted_role_for_availability(
+                snapshot.identity,
+                snapshot.leader_party_member_id,
+                configured_p1_available,
+                p1_present=p1_present,
+                previous_role=getattr(self, "ko_promoted_follower_role", None),
+            )
         )
 
         self.ko_promoted_follower_role = ko_promoted_role
@@ -7712,6 +7907,7 @@ class CoopMenuRuntime:
             None
             if (
                 not coop_active
+                or summon_active
                 or transient_handoff
                 or ko_promoted_role is not None
                 or uncertain_follower_leader
@@ -7852,10 +8048,17 @@ class CoopMenuRuntime:
         self.runtime_catalog_p1_owner = int(p1_owner_member_id)
 
     def _controlled_member_id(self, player: int) -> int | None:
-        identity = self.session_snapshot.identity
+        identity = (
+            getattr(self, "live_role_identity_override", None)
+            or self.session_snapshot.identity
+        )
         player = int(player)
         if player == 1:
-            fallback = self.session_snapshot.p1_owner_party_member_id
+            fallback = (
+                identity.p1_party_member_id
+                if identity != self.session_snapshot.identity
+                else self.session_snapshot.p1_owner_party_member_id
+            )
             offset = P1_CONTROLLED_ACTOR_OFFSET
         elif player == 2:
             fallback = identity.p2_party_member_id
@@ -8427,21 +8630,20 @@ class CoopMenuRuntime:
             and model.pending_action.action_id == P1_CHANGE_LEADER_ACTION_ID
         )
         if character_select or leader_select:
-            p1_member_ids = {
-                self.session_snapshot.p1_owner_party_member_id,
-                getattr(
-                    self.session_snapshot,
-                    "p1_reserved_party_member_id",
-                    self.session_snapshot.identity.p1_party_member_id,
-                ),
-            }
+            p1_owner_member_id = self.session_snapshot.p1_owner_party_member_id
+            p1_reserved_member_id = getattr(
+                self.session_snapshot,
+                "p1_reserved_party_member_id",
+                self.session_snapshot.identity.p1_party_member_id,
+            )
             for member_id, name, handle, actor in self.active_party:
                 selectable = bool(
                     member_id in session_state.MAIN_PARTY_MEMBER_IDS
                     if leader_select
-                    else all(
-                        coop_character_role_candidate(member_id, p1_member_id)
-                        for p1_member_id in p1_member_ids
+                    else coop_character_role_candidate(
+                        member_id,
+                        p1_owner_member_id,
+                        p1_reserved_member_id,
                     )
                 )
                 # Both leader and follower role transfers hand manual ownership
@@ -8639,7 +8841,6 @@ class CoopMenuRuntime:
             "p1_reserved_party_member_id",
             identity.p1_party_member_id,
         )
-        p1_member_ids = {p1_owner_member_id, p1_reserved_member_id}
         selected = next(
             (
                 entry
@@ -8655,12 +8856,15 @@ class CoopMenuRuntime:
             )
             return 0
         member_id, name, handle, actor = selected
-        if not all(
-            coop_character_role_candidate(member_id, p1_member_id)
-            for p1_member_id in p1_member_ids
+        if not coop_character_role_candidate(
+            member_id,
+            p1_owner_member_id,
+            p1_reserved_member_id,
         ):
             reason = (
-                "p1-owned" if member_id in p1_member_ids else "guest-or-story-member"
+                "p1-role-unstable"
+                if member_id in (p1_owner_member_id, p1_reserved_member_id)
+                else "guest-or-story-member"
             )
             print(
                 f"P{player}_CHARACTER_SELECT_REJECTED {reason}",
@@ -8687,6 +8891,20 @@ class CoopMenuRuntime:
                 flush=True,
             )
             return 1
+
+        if member_id == p1_owner_member_id:
+            # P2/P3 selected the live P1 actor.  Make the follower's previous
+            # actor the new native leader; native_leader_role_permutation then
+            # assigns the selected former leader to this follower in the same
+            # authenticated movement/HUD transaction.
+            result = self.select_p1_leader(owner[2])
+            if result:
+                print(
+                    f"P{player}_CHARACTER_EXCHANGE_REQUEST "
+                    f"p1={member_id} follower={old_member_id}",
+                    flush=True,
+                )
+            return result
 
         magnitude_address = (
             legacy.coop.COMMAND_BLOCK + 0x04
@@ -8847,6 +9065,7 @@ class CoopMenuRuntime:
             self.p1_leader_handoff_member_id = None
             self.p1_leader_handoff_deadline = 0.0
             self.p1_leader_handoff_identity = None
+            self.live_role_identity_override = None
             self.p1_leader_handoff_identity_saved = False
             self.p1_leader_handoff_save_retry_at = 0.0
             self.last_actor_refresh = 0.0
@@ -8863,6 +9082,11 @@ class CoopMenuRuntime:
         # native leader; that later promotion must not revoke role persistence.
         native_completed = outcome == "applied"
         desired_identity = getattr(self, "p1_leader_handoff_identity", None)
+        if native_completed and desired_identity is not None:
+            if getattr(self, "live_role_identity_override", None) != desired_identity:
+                self.live_role_identity_override = desired_identity
+                if hasattr(self, "menu_theme_signature"):
+                    self.menu_theme_signature = None
         identity_saved = bool(
             getattr(self, "p1_leader_handoff_identity_saved", False)
         )
@@ -11313,6 +11537,7 @@ class CoopMenuRuntime:
     ) -> None:
         if not snapshot.native_menu_open:
             self.unexpected_native_menu_cancel_latched = False
+            self.unexpected_native_menu_cancel_retry_at = 0.0
         if snapshot.loading or snapshot.cutscene:
             self.native_frontend_open_candidate_since = None
             if self.native_frontend_custom_suspended:
@@ -11329,6 +11554,17 @@ class CoopMenuRuntime:
                 int(getattr(self, "role_generation", 0))
                 != self.native_frontend_suspended_role_generation
             )
+            if (
+                roles_changed
+                and self.native_frontend_suspension_source
+                == "dead_party_recovery"
+            ):
+                # Moving a living reserve into an active slot belongs to the
+                # same stock recovery transaction and must retain native input.
+                self.native_frontend_suspended_role_generation = int(
+                    getattr(self, "role_generation", 0)
+                )
+                roles_changed = False
             if generation_changed or roles_changed:
                 reason = (
                     "battle_generation" if generation_changed else "role_generation"
@@ -12199,8 +12435,9 @@ class CoopMenuRuntime:
                 return False
             if self.p1_leader_selector_active():
                 # This is a rootless modal, not an ordinary action TARGET page.
-                # Cancel must use its transactional close path, and horizontal
-                # inputs (including LB/RB aliases) are intentionally inert.
+                # Cancel uses its transactional close path. Horizontal aliases
+                # remain inert here; P1 LB is independently left native so the
+                # game can still toggle Turbo while this selector is visible.
                 if controls.cancel:
                     self.close_p1_leader_selector()
                     return False
@@ -12208,18 +12445,18 @@ class CoopMenuRuntime:
                     self.dispatch_p1(InputCommand.CONFIRM)
                     return False
                 if controls.up and not controls.down:
-                    self.dispatch_p1(InputCommand.UP)
+                    self.dispatch_p1(vertical_input_command(-1, controls.up_edge))
                 elif controls.down and not controls.up:
-                    self.dispatch_p1(InputCommand.DOWN)
+                    self.dispatch_p1(vertical_input_command(1, controls.down_edge))
                 return False
             if controls.page_up and not controls.page_down:
                 self.dispatch_p1(InputCommand.PAGE_UP)
             elif controls.page_down and not controls.page_up:
                 self.dispatch_p1(InputCommand.PAGE_DOWN)
             elif controls.up:
-                self.dispatch_p1(InputCommand.UP)
+                self.dispatch_p1(vertical_input_command(-1, controls.up_edge))
             elif controls.down:
-                self.dispatch_p1(InputCommand.DOWN)
+                self.dispatch_p1(vertical_input_command(1, controls.down_edge))
             if controls.target_group:
                 self.dispatch_p1(InputCommand.CYCLE_TARGET_GROUP)
             if controls.confirm:
@@ -12357,18 +12594,18 @@ class CoopMenuRuntime:
                 self.dispatch_p3(InputCommand.CONFIRM)
                 return self.role_generation != input_role_generation
             if controls.up and not controls.down:
-                self.dispatch_p3(InputCommand.UP)
+                self.dispatch_p3(vertical_input_command(-1, controls.up_edge))
             elif controls.down and not controls.up:
-                self.dispatch_p3(InputCommand.DOWN)
+                self.dispatch_p3(vertical_input_command(1, controls.down_edge))
             return False
         if controls.page_up and not controls.page_down:
             self.dispatch_p3(InputCommand.PAGE_UP)
         elif controls.page_down and not controls.page_up:
             self.dispatch_p3(InputCommand.PAGE_DOWN)
         elif controls.up:
-            self.dispatch_p3(InputCommand.UP)
+            self.dispatch_p3(vertical_input_command(-1, controls.up_edge))
         elif controls.down:
-            self.dispatch_p3(InputCommand.DOWN)
+            self.dispatch_p3(vertical_input_command(1, controls.down_edge))
         if controls.target_group_direction < 0:
             self.dispatch_p3(InputCommand.CYCLE_TARGET_GROUP_PREVIOUS)
         elif controls.target_group_direction > 0 or controls.target_group:
@@ -12486,18 +12723,18 @@ class CoopMenuRuntime:
                 self.dispatch(InputCommand.CONFIRM)
                 return
             if controls.up and not controls.down:
-                self.dispatch(InputCommand.UP)
+                self.dispatch(vertical_input_command(-1, controls.up_edge))
             elif controls.down and not controls.up:
-                self.dispatch(InputCommand.DOWN)
+                self.dispatch(vertical_input_command(1, controls.down_edge))
             return
         if controls.page_up and not controls.page_down:
             self.dispatch(InputCommand.PAGE_UP)
         elif controls.page_down and not controls.page_up:
             self.dispatch(InputCommand.PAGE_DOWN)
         elif controls.up:
-            self.dispatch(InputCommand.UP)
+            self.dispatch(vertical_input_command(-1, controls.up_edge))
         elif controls.down:
-            self.dispatch(InputCommand.DOWN)
+            self.dispatch(vertical_input_command(1, controls.down_edge))
         if controls.target_group_direction < 0:
             self.dispatch(InputCommand.CYCLE_TARGET_GROUP_PREVIOUS)
         elif controls.target_group_direction > 0 or controls.target_group:
@@ -12709,22 +12946,61 @@ class CoopMenuRuntime:
             circle_decides,
             excluded_keyboard_vks=(0x01,),
         )
+        fast_scroll = {
+            player: bool(
+                model.mode is MenuMode.LIST
+                and self.bindings.down(player, "native_party_menu")
+            )
+            for player, model in (
+                ("p1", self.p1_model),
+                ("p2", self.model),
+                ("p3", self.p3_model),
+            )
+        }
         # Sample P1 directional histories before every early-return gate.
         # Otherwise a direction held through Pause/native frontend suspension
         # looks like a fresh edge/repeat when the custom route resumes.
         p1_direction_repeat = {
-            action: self.bindings.repeat("p1", action)
+            action: (
+                self.bindings.repeat("p1", action, accelerated=True)
+                if fast_scroll["p1"] and action in ("menu_up", "menu_down")
+                else self.bindings.repeat("p1", action)
+            )
             for action in ("menu_up", "menu_down", "menu_left", "menu_right")
         }
         p1_direction_edge = {
             action: self.bindings.edge("p1", action)
             for action in ("menu_up", "menu_down")
         }
+        p2_direction_edge = {
+            action: self.bindings.edge("p2", action)
+            for action in ("menu_up", "menu_down")
+        }
+        p3_direction_edge = {
+            action: self.bindings.edge("p3", action)
+            for action in ("menu_up", "menu_down")
+        }
 
-        p2_character_dpad_up = self.bindings.repeat("p2", "menu_up")
-        p2_character_dpad_down = self.bindings.repeat("p2", "menu_down")
-        p3_character_dpad_up = self.bindings.repeat("p3", "menu_up")
-        p3_character_dpad_down = self.bindings.repeat("p3", "menu_down")
+        p2_character_dpad_up = (
+            self.bindings.repeat("p2", "menu_up", accelerated=True)
+            if fast_scroll["p2"]
+            else self.bindings.repeat("p2", "menu_up")
+        )
+        p2_character_dpad_down = (
+            self.bindings.repeat("p2", "menu_down", accelerated=True)
+            if fast_scroll["p2"]
+            else self.bindings.repeat("p2", "menu_down")
+        )
+        p3_character_dpad_up = (
+            self.bindings.repeat("p3", "menu_up", accelerated=True)
+            if fast_scroll["p3"]
+            else self.bindings.repeat("p3", "menu_up")
+        )
+        p3_character_dpad_down = (
+            self.bindings.repeat("p3", "menu_down", accelerated=True)
+            if fast_scroll["p3"]
+            else self.bindings.repeat("p3", "menu_down")
+        )
         p2_character_direction_down = bool(
             self.bindings.down("p2", "menu_up") or self.bindings.down("p2", "menu_down")
         )
@@ -12736,6 +13012,12 @@ class CoopMenuRuntime:
             player: self.bindings.edge(player, "native_party_menu")
             for player in ("p1", "p2", "p3")
         }
+        # Triangle/Y is a stock fast-scroll modifier while a battle list owns
+        # input.  Consume its edge here so the same press cannot also request
+        # the native Party/Licences screen underneath the custom menu.
+        for player, active in fast_scroll.items():
+            if active:
+                native_party_menu_edges[player] = False
         battle_menu_edges = {
             player: self.bindings.edge(player, "battle_menu")
             for player in ("p2", "p3")
@@ -12863,6 +13145,13 @@ class CoopMenuRuntime:
             (p1_physical_pause or native_pause_sources)
             and native_pause_request_allowed(snapshot)
         ):
+            pause_visibility_gate = getattr(
+                self,
+                "native_pause_visibility_gate",
+                None,
+            )
+            if pause_visibility_gate is not None:
+                pause_visibility_gate.arm(now=input_now, foreground=foreground)
             self._publish_native_input_contract(
                 # A synthetic Pause pulse is evaluated before these masks.
                 # Preserve replacement firewalls until native_pause_open is
@@ -12959,7 +13248,30 @@ class CoopMenuRuntime:
         active_actor_alive = (p1_actor_alive,) + (
             (p2_actor_alive,) if len(self.party) >= 2 else ()
         ) + ((p3_actor_alive,) if len(self.party) >= 3 else ())
-        dead_party_recovery = native_party_recovery_required(active_actor_alive)
+        active_party_dead = native_party_recovery_required(active_actor_alive)
+        recovery_was_latched = bool(
+            getattr(self, "native_dead_party_recovery_passthrough", False)
+        )
+        if active_party_dead and not recovery_was_latched:
+            self.native_dead_party_recovery_observed_open = False
+        if snapshot.native_menu_open and recovery_was_latched:
+            self.native_dead_party_recovery_observed_open = True
+        dead_party_recovery = native_party_recovery_passthrough_required(
+            active_actor_alive,
+            latched=recovery_was_latched,
+            native_menu_observed=bool(
+                getattr(
+                    self,
+                    "native_dead_party_recovery_observed_open",
+                    False,
+                )
+            ),
+            native_menu_open=bool(snapshot.native_menu_open),
+            native_frontend_suspended=bool(
+                self.native_frontend_custom_suspended
+            ),
+            suspension_source=str(self.native_frontend_suspension_source),
+        )
         if dead_party_recovery:
             if self.native_party_menu_request_pending:
                 self.cancel_native_party_menu_request(
@@ -12967,6 +13279,7 @@ class CoopMenuRuntime:
                     publish_policy=False,
                 )
             if snapshot.native_menu_open:
+                self.native_dead_party_recovery_observed_open = True
                 self.suspend_custom_menus_for_native_frontend(
                     "dead_party_recovery",
                     now=input_now,
@@ -13002,6 +13315,7 @@ class CoopMenuRuntime:
             return
         if bool(getattr(self, "native_dead_party_recovery_passthrough", False)):
             self.native_dead_party_recovery_passthrough = False
+            self.native_dead_party_recovery_observed_open = False
             print("NATIVE_PARTY_RECOVERY_INPUT_RECLAIMED", flush=True)
         native_party_menu_now = time.monotonic()
         if (
@@ -13058,6 +13372,17 @@ class CoopMenuRuntime:
             now=native_party_menu_now,
         ):
             return
+        native_command_lifecycle = (
+            self.p1_native_lifecycle() if self.p1_visual_replacement else None
+        )
+        wait_presentation_owned = (
+            self.native_wait_mode_bridge.owns_native_presentation()
+        )
+        unexpected_native_command_open = bool(
+            not wait_presentation_owned
+            and native_command_lifecycle is not None
+            and native_command_lifecycle[2] == native_command_lifecycle[0]
+        )
         trusted_native_menu = self.native_frontend_input_trusted(snapshot)
         unproven_native_menu = bool(
             snapshot.native_menu_open
@@ -13068,8 +13393,9 @@ class CoopMenuRuntime:
             and not self.native_quickening_active
         )
         if unproven_native_menu:
-            quarantine = self.native_frontend_quarantine_required(
-                native_party_menu_now
+            quarantine = bool(
+                unexpected_native_command_open
+                or self.native_frontend_quarantine_required(native_party_menu_now)
             )
             self._publish_native_input_contract(
                 p1_replacement=True,
@@ -13083,18 +13409,54 @@ class CoopMenuRuntime:
                 suppress_mouse_look=False,
             )
             self._clear_native_desktop_route()
-            if quarantine and not getattr(
-                self, "unexpected_native_menu_cancel_latched", False
-            ):
+            cancel_latched = bool(
+                getattr(self, "unexpected_native_menu_cancel_latched", False)
+            )
+            cancel_retry_at = float(
+                getattr(self, "unexpected_native_menu_cancel_retry_at", 0.0)
+            )
+            retry_forced_command = bool(
+                unexpected_native_command_open
+                and cancel_latched
+                and native_party_menu_now >= cancel_retry_at
+            )
+            if quarantine and (not cancel_latched or retry_forced_command):
                 self.native_dialog_bridge.pulse(NATIVE_DIALOG_CANCEL)
                 self.unexpected_native_menu_cancel_latched = True
-                print("UNEXPECTED_NATIVE_MENU_CANCEL_PULSED", flush=True)
+                self.unexpected_native_menu_cancel_retry_at = (
+                    native_party_menu_now
+                    + UNEXPECTED_NATIVE_COMMAND_CANCEL_RETRY_SECONDS
+                )
+                if (
+                    unexpected_native_command_open
+                    and not cancel_latched
+                    and self.p1_model.mode is MenuMode.CLOSED
+                ):
+                    # Story/tutorial code can open COMMAND directly without a
+                    # physical button edge. Convert that forced native open into
+                    # the custom P1 command tree as soon as the native lifecycle
+                    # acknowledges the cancel, so the player never needs F8 to
+                    # escape the tutorial frontend.
+                    self.p1_frontend_deferred_open_until = (
+                        native_party_menu_now + P1_FRONTEND_DEFERRED_OPEN_SECONDS
+                    )
+                    self.p1_confirm_reopen_guard.arm(native_party_menu_now)
+                    print(
+                        "UNEXPECTED_NATIVE_COMMAND_CUSTOM_OPEN_DEFERRED",
+                        flush=True,
+                    )
+                print(
+                    "UNEXPECTED_NATIVE_MENU_CANCEL_PULSED "
+                    f"retry={int(retry_forced_command)}",
+                    flush=True,
+                )
             # A stable external frontend (for example Map) is adopted only by
             # maintain_native_frontend_suspension after its settle interval.
             # Until then the raw generic bit cannot lower any resident mask.
             return
         if not snapshot.native_menu_open:
             self.unexpected_native_menu_cancel_latched = False
+            self.unexpected_native_menu_cancel_retry_at = 0.0
         p1_route_available = bool(
             p1_actor
             and snapshot.p1_gameplay_ready
@@ -13137,13 +13499,6 @@ class CoopMenuRuntime:
         ):
             self.hard_close_p3_menu()
             print("P3_MENU_CLOSED owner=unavailable", flush=True)
-        native_command_lifecycle = (
-            self.p1_native_lifecycle() if self.p1_visual_replacement else None
-        )
-
-        wait_presentation_owned = (
-            self.native_wait_mode_bridge.owns_native_presentation()
-        )
         p1_native_command_open = bool(
             not wait_presentation_owned
             and native_command_lifecycle is not None
@@ -13247,7 +13602,11 @@ class CoopMenuRuntime:
         p1_lb_policy = custom_directional_bridge_enabled(
             snapshot.bridge_ownership_allowed,
             self.custom_ui_suppressed or self.native_frontend_custom_suspended,
-            p1_menu_owns_lb(self.p1_model.mode),
+            p1_menu_owns_lb(
+                self.p1_model.mode,
+                directional_owner=custom_directional_owner,
+                leader_selector_active=self.p1_leader_selector_active(),
+            ),
         )
         p2_binding_enabled = bool(
             p2_manual_control_enabled
@@ -13483,6 +13842,16 @@ class CoopMenuRuntime:
             )
 
         share_leader_menu = bool(not self.coop_runtime_active and p1_binding_enabled)
+        p1_effective_up_edge = bool(
+            p1_direction_edge["menu_up"]
+            or (share_leader_menu and p2_direction_edge["menu_up"])
+            or (share_leader_menu and p3_direction_edge["menu_up"])
+        )
+        p1_effective_down_edge = bool(
+            p1_direction_edge["menu_down"]
+            or (share_leader_menu and p2_direction_edge["menu_down"])
+            or (share_leader_menu and p3_direction_edge["menu_down"])
+        )
         p2_confirm_edge = self.bindings.native_action_edge(
             "p2",
             "confirm",
@@ -13633,6 +14002,8 @@ class CoopMenuRuntime:
         p1_input = PlayerMenuInput(
             up=p1_up,
             down=p1_down,
+            up_edge=p1_effective_up_edge,
+            down_edge=p1_effective_down_edge,
             left=p1_left,
             right=p1_right,
             page_up=bool(self.p1_model.mode is MenuMode.LIST and p1_left),
@@ -13646,6 +14017,8 @@ class CoopMenuRuntime:
         p2_input = PlayerMenuInput(
             up=up,
             down=down,
+            up_edge=p2_direction_edge["menu_up"],
+            down_edge=p2_direction_edge["menu_down"],
             page_up=bool(
                 self.model.mode is MenuMode.LIST
                 and (p2_target_previous or p2_menu_left_edge)
@@ -13675,6 +14048,8 @@ class CoopMenuRuntime:
         p3_input = PlayerMenuInput(
             up=p3_up,
             down=p3_down,
+            up_edge=p3_direction_edge["menu_up"],
+            down_edge=p3_direction_edge["menu_down"],
             page_up=bool(
                 self.p3_model.mode is MenuMode.LIST
                 and (p3_target_previous or p3_menu_left_edge)
@@ -13760,6 +14135,8 @@ class CoopMenuRuntime:
         p1_input = PlayerMenuInput(
             up=p1_up,
             down=p1_down,
+            up_edge=p1_effective_up_edge,
+            down_edge=p1_effective_down_edge,
             left=p1_left,
             right=p1_right,
             page_up=bool(self.p1_model.mode is MenuMode.LIST and p1_left),
@@ -13853,8 +14230,8 @@ class CoopMenuRuntime:
         progress = min(1.0, max(0.0, now - started) / TARGET_ENTER_SECONDS)
         return progress * progress * (3.0 - 2.0 * progress)
 
-    def paint_target_info_backdrop(self) -> None:
-        now = time.monotonic()
+    def paint_target_info_backdrop(self, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else float(now)
         delta = min(
             0.05,
             max(0.0, now - self.target_info_backdrop_last_tick),
@@ -14610,7 +14987,12 @@ class CoopMenuRuntime:
             snapshot, frame_now
         )
         self.maintain_native_frontend_suspension(snapshot, now=frame_now)
-        native_pause_open = native_pause_screen_open(self.process)
+        raw_native_pause_open = native_pause_screen_open(self.process)
+        native_pause_open = self.native_pause_visibility_gate.update(
+            raw_native_pause_open,
+            foreground=foreground,
+            now=frame_now,
+        )
         native_action_ids = native_party_action_ids(self.process, self.party)
         self.native_quickening_active = bool(
             native_action_ids & QUICKENING_PRESENTATION_ACTION_IDS

@@ -23,6 +23,7 @@ from headless_menu_shell import (
     NATIVE_INPUT_CONFIRM_MASK,
     NATIVE_INPUT_CUSTOM_DIRECTION_MASK,
     NATIVE_INPUT_LB_MASK,
+    NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
     NATIVE_INPUT_PARTY_MASK,
     NATIVE_INPUT_POLICY_ACTIVE_OFFSET,
     NATIVE_INPUT_POLICY_SLOT_SIZE,
@@ -32,6 +33,7 @@ from headless_menu_shell import (
     QUICKENING_BLOCK_CONFIRM,
     DirectionalReleaseGuard,
     NativeDialogInputBridge,
+    NativePauseVisibilityGate,
     native_input_policy,
     custom_directional_bridge_enabled,
     custom_directional_control_down,
@@ -40,6 +42,7 @@ from headless_menu_shell import (
     p1_command_mask_requested,
     p1_frontend_close_handoff_active,
     p1_menu_input_owned,
+    p1_menu_owns_lb,
     p1_native_party_request_blocked,
     p1_pause_suspension_required,
     native_decide_button,
@@ -277,7 +280,11 @@ class NativeDialogBridgeStateTests(unittest.TestCase):
         bridge.set_custom_directional_owner(True)
         _address, packed_policy = process.writes[0]
         p1_mask, other_mask, _slot, flags = struct.unpack("<4I", packed_policy)
-        self.assertEqual(p1_mask & NATIVE_INPUT_CUSTOM_DIRECTION_MASK, NATIVE_INPUT_CUSTOM_DIRECTION_MASK)
+        self.assertEqual(
+            p1_mask & NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
+            NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
+        )
+        self.assertFalse(p1_mask & NATIVE_INPUT_LB_MASK)
         self.assertEqual(other_mask & NATIVE_INPUT_CUSTOM_DIRECTION_MASK, NATIVE_INPUT_CUSTOM_DIRECTION_MASK)
         self.assertTrue(flags & NATIVE_INPUT_POLICY_SUPPRESS_WHEEL)
         self.assertEqual(
@@ -304,6 +311,32 @@ class NativeDialogBridgeStateTests(unittest.TestCase):
         self.assertTrue(p1_mask & NATIVE_INPUT_LB_MASK)
         self.assertFalse(other_mask & NATIVE_INPUT_LB_MASK)
 
+    def test_p1_leader_selector_releases_only_p1_lb_for_native_turbo(self):
+        self.assertFalse(
+            p1_menu_owns_lb(
+                MenuMode.TARGET,
+                directional_owner=True,
+                leader_selector_active=True,
+            )
+        )
+        policy = native_input_policy(
+            p1_replacement=False,
+            non_p1_command_blocked=False,
+            custom_directional_owner=True,
+            p1_menu_owns_lb=False,
+            party_menu_blocked=False,
+            quickening_block_mask=0,
+            leader_replacement=False,
+            capture_desktop_events=False,
+            p1_native_slot=0,
+        )
+        self.assertFalse(policy.p1_semantic_mask & NATIVE_INPUT_LB_MASK)
+        self.assertEqual(
+            policy.p1_semantic_mask & NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
+            NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
+        )
+        self.assertTrue(policy.other_semantic_mask & NATIVE_INPUT_LB_MASK)
+
     def test_p1_battle_menu_wins_over_a_same_frame_party_request(self):
         self.assertTrue(p1_native_party_request_blocked(MenuMode.CLOSED, None, True))
         self.assertTrue(p1_native_party_request_blocked(MenuMode.LIST, None, False))
@@ -324,21 +357,41 @@ class NativeDialogBridgeStateTests(unittest.TestCase):
             p1_native_slot=0,
         )
         self.assertEqual(
-            policy.p1_semantic_mask & NATIVE_INPUT_CUSTOM_DIRECTION_MASK,
-            NATIVE_INPUT_CUSTOM_DIRECTION_MASK,
+            policy.p1_semantic_mask & NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
+            NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK,
         )
         self.assertEqual(
             policy.other_semantic_mask & NATIVE_INPUT_CUSTOM_DIRECTION_MASK,
             NATIVE_INPUT_CUSTOM_DIRECTION_MASK,
         )
-        # LB and RB are navigation aliases in the base profile.  They must be
-        # owned globally with the d-pad throughout a custom-menu lifecycle so
-        # neither P1 nor a follower can leak a stock leader action on close.
-        self.assertTrue(policy.p1_semantic_mask & NATIVE_INPUT_LB_MASK)
+        # P1 LB has an independent owner so the Leader selector can preserve
+        # native Turbo. Followers still own LB with the remaining navigation.
+        self.assertFalse(policy.p1_semantic_mask & NATIVE_INPUT_LB_MASK)
         self.assertTrue(policy.other_semantic_mask & NATIVE_INPUT_LB_MASK)
         self.assertFalse(policy.p1_semantic_mask & NATIVE_INPUT_CONFIRM_MASK)
         self.assertIn(b"\x41\x0f\xa3\xc0", cave)
         self.assertIn(NATIVE_GET_BUTTON_ORIGINAL, cave)
+
+    def test_pause_visibility_survives_pointer_dropout_and_focus_resume(self):
+        gate = NativePauseVisibilityGate(
+            pointer_dropout_seconds=0.30,
+            focus_resume_seconds=0.50,
+        )
+        self.assertTrue(gate.update(True, foreground=True, now=1.0))
+        self.assertTrue(gate.update(False, foreground=True, now=1.20))
+        self.assertTrue(gate.update(False, foreground=False, now=4.0))
+        self.assertTrue(gate.update(False, foreground=True, now=8.0))
+        self.assertTrue(gate.update(False, foreground=True, now=8.49))
+        self.assertFalse(gate.update(False, foreground=True, now=8.51))
+
+    def test_accepted_pause_edge_is_guarded_until_native_object_appears(self):
+        gate = NativePauseVisibilityGate(
+            pointer_dropout_seconds=0.30,
+            focus_resume_seconds=0.50,
+        )
+        gate.arm(now=2.0, foreground=True)
+        self.assertTrue(gate.update(False, foreground=True, now=2.20))
+        self.assertFalse(gate.update(False, foreground=True, now=2.31))
 
     def test_f6_masks_stock_x_a_and_b_command_buttons(self):
         policy = native_input_policy(

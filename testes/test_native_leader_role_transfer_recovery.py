@@ -231,6 +231,162 @@ def test_p1_swap_with_p2_preserves_dead_p3_role_identity():
     assert transfer.identity.p3_party_member_id == current_identity.p3_party_member_id
 
 
+def test_p1_swap_with_active_p3_preserves_unrelated_off_party_p2_role():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    layout = (0, 4, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+    current_identity = session_state.SessionIdentity(4, 3, 0)
+
+    sequence, replacement = coop.request_native_leader_role_transfer(
+        process,
+        0,
+        current_identity,
+        layout,
+        layout,
+        manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+    )
+
+    assert sequence == 1
+    assert replacement == session_state.SessionIdentity(0, 3, 4)
+    transfer = coop.read_native_leader_role_transfer(process)
+    assert transfer is not None
+    assert transfer.identity == replacement
+    assert transfer.p1_hud_slot == 0
+    assert transfer.p2_hud_slot == coop.INVALID_HUD_PARTY_SLOT
+    assert transfer.p3_hud_slot == 1
+
+
+def test_p1_swap_with_active_p2_preserves_unrelated_off_party_p3_role():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    layout = (0, 4, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+    current_identity = session_state.SessionIdentity(4, 0, 3)
+
+    sequence, replacement = coop.request_native_leader_role_transfer(
+        process,
+        0,
+        current_identity,
+        layout,
+        layout,
+        manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+    )
+
+    assert sequence == 1
+    assert replacement == session_state.SessionIdentity(0, 4, 3)
+    transfer = coop.read_native_leader_role_transfer(process)
+    assert transfer is not None
+    assert transfer.identity == replacement
+    assert transfer.p1_hud_slot == 0
+    assert transfer.p2_hud_slot == 1
+    assert transfer.p3_hud_slot == coop.INVALID_HUD_PARTY_SLOT
+
+
+def test_off_party_unrelated_role_does_not_block_role_transfer_preparation():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    layout = (0, 4, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+    current_identity = session_state.SessionIdentity(4, 3, 0)
+    battle_info = 0x62000000
+    location_base = 0x63000000
+    actor_manager = 0x64000000
+    location_id = 0x1234
+    process.write(session_state.BATTLE_INFO_GLOBAL, struct.pack("<Q", battle_info))
+    process.write(session_state.LOCATION_SAVE_GLOBAL, struct.pack("<Q", location_base))
+    process.write(coop.ACTOR_MANAGER_GLOBAL, struct.pack("<Q", actor_manager))
+    process.write(actor_manager, struct.pack("<I", 2))
+    for layout_index in (
+        session_state.BATTLE_CURRENT_LAYOUT,
+        session_state.BATTLE_UI_LAYOUT,
+    ):
+        process.write(
+            battle_info
+            + session_state.BATTLE_PARTY_LAYOUT_OFFSET
+            + session_state.BATTLE_PARTY_LAYOUT_STRIDE * layout_index,
+            struct.pack("<4H", *layout),
+        )
+    process.write(
+        location_base + session_state.LOCATION_CURRENT_OFFSET,
+        struct.pack("<I", location_id),
+    )
+    process.write(
+        location_base + session_state.LOCATION_UI_OFFSET,
+        struct.pack("<I", location_id),
+    )
+    sequence, replacement = coop.request_native_leader_role_transfer(
+        process,
+        0,
+        current_identity,
+        layout,
+        layout,
+        manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+    )
+    transfer = coop.read_native_leader_role_transfer(process)
+    snapshot = SimpleNamespace(
+        identity=current_identity,
+        current_layout=layout,
+        ui_layout=layout,
+        loading=False,
+        cutscene=False,
+        leader_party_member_id=4,
+        battle_info=battle_info,
+        current_location=location_id,
+        ui_location=location_id,
+    )
+
+    with (
+        mock.patch.object(
+            coop.session_state,
+            "map_party_slot_actors",
+            return_value={
+                0: (0x60020000, 0x60020800),
+                4: (0x60030000, 0x60030800),
+            },
+        ),
+        mock.patch.object(coop, "fresh_role_actor_mapping", side_effect=lambda entry: entry),
+        mock.patch.object(coop, "actor_is_alive", return_value=True),
+        mock.patch.object(coop, "actor_u32_or_zero", return_value=0xA11CE),
+        mock.patch.object(coop, "leader_heading_pair", return_value=(0.0, 0.0)),
+    ):
+        assert coop.prepare_native_leader_role_transfer(
+            process,
+            transfer,
+            snapshot,
+            {},
+            ActorGenerations(),
+            world_epoch=9,
+            manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+        )
+
+    prepared = coop.read_native_leader_role_transfer(process)
+    assert prepared is not None and prepared.prepared
+    assert prepared.sequence == sequence
+    assert prepared.identity == replacement
+    assert prepared.p2_movement_sequence == 0
+    assert prepared.p3_movement_sequence != 0
+
+
+def test_off_party_target_role_is_still_rejected_before_publication():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    layout = (0, 4, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+
+    with pytest.raises(ValueError, match="coherent permutation"):
+        coop.request_native_leader_role_transfer(
+            process,
+            3,
+            session_state.SessionIdentity(4, 3, 0),
+            layout,
+            layout,
+            manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+        )
+
+    assert process.writes == []
+
+
 def test_prepared_write_lands_then_raises_preserves_reservation_and_ends_frame():
     process, sequence, _identity, reported, old_p2, old_p3 = (
         _prepare_faulted_transaction()
@@ -734,6 +890,45 @@ def test_transient_layout_change_never_reaches_cancel_threshold():
     assert not tracker.observe(transfer, changed)
     assert not tracker.observe(transfer, coherent)
     assert not tracker.observe(transfer, changed)
+    assert process.u32(
+        coop.P2_DEVICE_FILTER_STATE + coop.NATIVE_LEADER_ROLE_ACTIVE_OFFSET
+    ) == coop.NATIVE_LEADER_ROLE_ACTIVE
+
+
+def test_reserved_third_role_does_not_cancel_unchanged_two_player_swap():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    identity = session_state.SessionIdentity(4, 0, 3)
+    layout = (0, 4, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+    coop.request_native_leader_role_transfer(
+        process,
+        0,
+        identity,
+        layout,
+        layout,
+        manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+    )
+    transfer = coop.read_native_leader_role_transfer(process)
+    snapshot = SimpleNamespace(
+        identity=identity,
+        battle_info=0x62000000,
+        current_layout=layout,
+        ui_layout=layout,
+        leader_party_member_id=4,
+        current_location=10,
+        ui_location=10,
+        user_control_enabled=True,
+        native_menu_open=False,
+        native_modal_active=False,
+        loading=False,
+        cutscene=False,
+    )
+    tracker = coop.NativeLeaderRolePrepareCancellationTracker()
+
+    assert coop.native_leader_role_prepare_mismatch_signature(transfer, snapshot) is None
+    assert not tracker.observe(transfer, snapshot)
+    assert tracker.samples == 0
     assert process.u32(
         coop.P2_DEVICE_FILTER_STATE + coop.NATIVE_LEADER_ROLE_ACTIVE_OFFSET
     ) == coop.NATIVE_LEADER_ROLE_ACTIVE

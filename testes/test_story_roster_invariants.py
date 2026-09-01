@@ -9,6 +9,32 @@ import story_party_patch as story
 
 
 class StoryRosterInvariantTests(unittest.TestCase):
+    def test_coherent_esper_materialization_suspends_roster_repair(self):
+        empty = guard.EMPTY
+        default = (0, 5, 1, empty, 2, 3, 4, empty, empty)
+        summon = (5, empty, empty, 27, empty, empty, empty, empty, empty)
+        layouts = (default, summon, summon, default, default)
+
+        self.assertTrue(guard.coherent_temporary_summon(layouts))
+
+    def test_torn_or_non_esper_guest_does_not_suspend_roster_repair(self):
+        empty = guard.EMPTY
+        default = (0, 5, 1, empty, 2, 3, 4, empty, empty)
+        esper_current = (5, empty, empty, 27, empty, empty, empty, empty, empty)
+        esper_ui = (5, empty, empty, 28, empty, empty, empty, empty, empty)
+        ordinary_guest = (5, empty, empty, 11, empty, empty, empty, empty, empty)
+
+        self.assertFalse(
+            guard.coherent_temporary_summon(
+                (default, esper_current, esper_ui, default, default)
+            )
+        )
+        self.assertFalse(
+            guard.coherent_temporary_summon(
+                (default, ordinary_guest, ordinary_guest, default, default)
+            )
+        )
+
     def test_native_slot_partitions_hold_exhaustively(self):
         """Slots 0..2 are main, slot 3 guest, and 4..8 reserve."""
 

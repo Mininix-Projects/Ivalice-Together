@@ -60,6 +60,13 @@ class ThirdPlayerGaugeTests(unittest.TestCase):
         self.assertLess(last_actor_compare, native_family_test)
         self.assertEqual(cave.count(b"\x85\xc9"), 1)
 
+    def test_unmatched_native_gauge_palettes_are_not_overwritten(self):
+        process = FakeProcess()
+        movement.install_p2_gauge_color(process)
+
+        self.assertNotIn(movement.SIDE_GAUGE_PALETTE, process.writes)
+        self.assertNotIn(movement.OTHER_GAUGE_PALETTE, process.writes)
+
     def test_p3_has_private_palette_and_interpolator(self):
         process = FakeProcess()
         movement.install_p2_gauge_color(process)

@@ -35,6 +35,8 @@ MAX_BINDINGS_PER_ACTION = 4
 
 INITIAL_REPEAT_DELAY = 0.250
 REPEAT_INTERVAL = 0.100
+FAST_REPEAT_INITIAL_DELAY = 0.100
+FAST_REPEAT_INTERVAL = 0.035
 AXIS_DEADZONE = 0.24
 SDL_PUMP_FAILURE_GRACE_SECONDS = 0.100
 XINPUT_STATE_FAILURE_GRACE_SECONDS = 0.100
@@ -2456,19 +2458,28 @@ class BindingPoller:
         self._previous[key] = current
         return current and not prior
 
-    def repeat(self, player: str, action: str) -> bool:
+    def repeat(self, player: str, action: str, *, accelerated: bool = False) -> bool:
         now = time.monotonic()
         key = (player, action, "repeat")
         current = self._event_strength(player, action) > 0.5
         prior = self._previous.get(key, False)
         self._previous[key] = current
         timer_key = (player, action)
+        initial_delay = (
+            FAST_REPEAT_INITIAL_DELAY if accelerated else INITIAL_REPEAT_DELAY
+        )
+        interval = FAST_REPEAT_INTERVAL if accelerated else REPEAT_INTERVAL
         if current and not prior:
-            self._next_repeat[timer_key] = now + INITIAL_REPEAT_DELAY
+            self._next_repeat[timer_key] = now + initial_delay
             return True
-        if current and now >= self._next_repeat.get(timer_key, math.inf):
-            self._next_repeat[timer_key] = now + REPEAT_INTERVAL
-            return True
+        if current:
+            next_repeat = self._next_repeat.get(timer_key, math.inf)
+            if accelerated:
+                next_repeat = min(next_repeat, now + interval)
+                self._next_repeat[timer_key] = next_repeat
+            if now >= next_repeat:
+                self._next_repeat[timer_key] = now + interval
+                return True
         if not current:
             self._next_repeat.pop(timer_key, None)
         return False

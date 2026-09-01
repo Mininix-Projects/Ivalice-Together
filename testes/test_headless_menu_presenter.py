@@ -269,6 +269,61 @@ class PresenterTests(unittest.TestCase):
         view = presenter.target_view()
         self.assertEqual(view.secondary_indices, (1,))
 
+    def test_foe_target_cursor_travels_with_temporal_afterimages(self):
+        model = P2MenuModel(ISSUER, make_demo_catalog())
+        model.set_candidates(
+            (
+                TargetCandidate(0x200027, "Wolf A", TargetGroup.FOES),
+                TargetCandidate(0x200028, "Wolf B", TargetGroup.FOES),
+            )
+        )
+        model.open()
+        model.confirm()
+        presenter = HeadlessMenuPresenter(model)
+        presenter.target_view(delta_seconds=1 / 120)
+
+        model.navigate(1)
+        moving = presenter.target_view(delta_seconds=1 / 120)
+
+        self.assertGreater(moving.cursor_position, 0.0)
+        self.assertLess(moving.cursor_position, 1.0)
+        self.assertTrue(moving.cursor_trail)
+
+    def test_reserve_target_cursor_uses_the_same_tween_and_afterimages(self):
+        action = ActionDefinition(
+            0x12345,
+            "Change Character",
+            "Choose a reserve character.",
+            (TargetGroup.RESERVE,),
+            TargetGroup.RESERVE,
+            "Party",
+        )
+        pages = {
+            "root": PageDefinition(
+                "root",
+                "",
+                (MenuEntry("Change", "", EntryKind.ACTION, action=action),),
+            )
+        }
+        model = P2MenuModel(ISSUER, pages)
+        model.set_candidates(
+            (
+                TargetCandidate(0x100001, "Vaan", TargetGroup.RESERVE),
+                TargetCandidate(0x100002, "Ashe", TargetGroup.RESERVE),
+            )
+        )
+        model.open()
+        model.confirm()
+        presenter = HeadlessMenuPresenter(model)
+        presenter.target_view(delta_seconds=1 / 120)
+
+        model.navigate(1)
+        moving = presenter.target_view(delta_seconds=1 / 120)
+
+        self.assertGreater(moving.cursor_position, 0.0)
+        self.assertLess(moving.cursor_position, 1.0)
+        self.assertTrue(moving.cursor_trail)
+
     def test_target_projection_advertises_only_legal_live_families(self):
         steal = ActionDefinition(
             0xA9,

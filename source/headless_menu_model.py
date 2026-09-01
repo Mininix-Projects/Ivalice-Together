@@ -330,13 +330,19 @@ class P2MenuModel:
     def toggle(self) -> MenuEvent:
         return self.close() if self.is_open else self.open()
 
-    def navigate(self, delta: int) -> MenuEvent:
+    def navigate(self, delta: int, *, wrap: bool = True) -> MenuEvent:
         if self.mode is MenuMode.TARGET:
             candidates = self.valid_candidates(self.target_group)
             if len(candidates) <= 1:
                 return MenuEvent("ignored")
             previous = self.target_index
-            self.target_index = (self.target_index + delta) % len(candidates)
+            if wrap:
+                self.target_index = (self.target_index + delta) % len(candidates)
+            else:
+                self.target_index = min(
+                    len(candidates) - 1,
+                    max(0, self.target_index + delta),
+                )
             if self.target_index == previous:
                 return MenuEvent("ignored")
             selected = candidates[self.target_index]
@@ -350,11 +356,21 @@ class P2MenuModel:
         state = self.stack[-1]
         count = len(self.page.entries)
         next_index = state.index
-        for _ in range(count):
-            next_index = (next_index + delta) % count
-
-            if self.page.entries[next_index].kind is not EntryKind.LABEL:
-                break
+        if wrap:
+            for _ in range(count):
+                next_index = (next_index + delta) % count
+                if self.page.entries[next_index].kind is not EntryKind.LABEL:
+                    break
+        else:
+            direction = -1 if delta < 0 else 1
+            next_index += direction
+            while (
+                0 <= next_index < count
+                and self.page.entries[next_index].kind is EntryKind.LABEL
+            ):
+                next_index += direction
+            if not 0 <= next_index < count:
+                return MenuEvent("ignored")
         if next_index == state.index:
             return MenuEvent("ignored")
         state.index = next_index

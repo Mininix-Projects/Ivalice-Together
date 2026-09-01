@@ -86,7 +86,9 @@ class HeadlessMenuPresenter:
         self.model = model
         self.max_visible_rows = max(1, int(max_visible_rows))
         self.cursor = CursorTween()
+        self.target_cursor = CursorTween()
         self._page_key: str | None = None
+        self._target_cursor_key: tuple[int, str] | None = None
         self._first_by_page: dict[str, int] = {}
         self._scroll_by_page: dict[str, CursorTween] = {}
         self._last_list_page_key: str | None = None
@@ -217,6 +219,15 @@ class HeadlessMenuPresenter:
             view.right_prompt,
             view.available_groups,
             bool(view.show_party_names),
+            (
+                None
+                if view.cursor_position is None
+                else round(float(view.cursor_position), 4)
+            ),
+            tuple(
+                (round(float(position), 4), round(float(opacity), 3))
+                for position, opacity in view.cursor_trail
+            ),
             view.secondary_indices,
             (
                 int(round(renderer.area_cursor_opacity(now) * 20.0))
@@ -252,6 +263,24 @@ class HeadlessMenuPresenter:
             self.cursor.retarget(float(self.model.index))
             self.cursor.advance(delta_seconds)
         return self.cursor.position
+
+    def _sync_target_cursor(self, delta_seconds: float) -> float:
+        if self.model.pending_action is None:
+            self._target_cursor_key = None
+            self.target_cursor.snap(0.0)
+            return 0.0
+        key = (
+            int(self.model.pending_action.action_id),
+            self.model.target_group.value,
+        )
+        selected = float(self.model.target_index)
+        if key != self._target_cursor_key:
+            self._target_cursor_key = key
+            self.target_cursor.snap(selected)
+        else:
+            self.target_cursor.retarget(selected)
+            self.target_cursor.advance(delta_seconds)
+        return self.target_cursor.position
 
     def _first_visible(self, page_key: str, selected: int, count: int) -> int:
         visible = min(count, self.visible_row_limit(page_key))
@@ -373,7 +402,7 @@ class HeadlessMenuPresenter:
             renderer.scale_three_player_panel(image)
         return True
 
-    def target_view(self) -> renderer.TargetView:
+    def target_view(self, *, delta_seconds: float = 0.0) -> renderer.TargetView:
         if self.model.mode is not MenuMode.TARGET or not self.model.pending_action:
             raise RuntimeError("P2 model is not targeting")
         candidates = self.model.valid_candidates()
@@ -392,6 +421,7 @@ class HeadlessMenuPresenter:
             for group in self.model.pending_action.target_groups
             if group is self.model.target_group or self.model.valid_candidates(group)
         )
+        cursor_position = self._sync_target_cursor(delta_seconds)
         return renderer.TargetView(
             action_name=self.model.pending_action.name,
             target_name=target_name,
@@ -407,6 +437,8 @@ class HeadlessMenuPresenter:
             right_prompt=self.target_prompts[1],
             available_groups=available_groups,
             show_party_names=show_party_names,
+            cursor_position=cursor_position,
+            cursor_trail=self.target_cursor.visible_trail(),
             secondary_indices=tuple(
                 index
                 for index in self.secondary_target_indices
@@ -428,7 +460,7 @@ class HeadlessMenuPresenter:
         if self.model.mode is MenuMode.CLOSED:
             return Image.new("RGBA", renderer.CANVAS_SIZE, (0, 0, 0, 0))
         if self.model.mode is MenuMode.TARGET:
-            target_view = self.target_view()
+            target_view = self.target_view(delta_seconds=delta_seconds)
             target_key = self._target_raster_key(
                 target_view,
                 now=now,
@@ -554,6 +586,7 @@ class HeadlessMenuPresenter:
         self._page_transition_from = None
         self._page_transition_started = 0.0
         self._last_target_group = None
+        self._target_cursor_key = None
         self._last_target_vertical_offset = 0
         self._target_transition_started = 0.0
         self._target_transition_delta_y = 0.0
@@ -563,6 +596,7 @@ class HeadlessMenuPresenter:
         self._raster_image = None
         self._raster_cache.clear()
         self.cursor.snap(0.0)
+        self.target_cursor.snap(0.0)
 
 
 __all__ = [

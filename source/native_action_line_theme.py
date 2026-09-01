@@ -20,6 +20,8 @@ ACTION_LINE_THEME_STATE_OFFSET = 0xA200
 ACTION_LINE_THEME_STATE_MAGIC = 0x314C5441
 ACTION_LINE_THEME_MAX_ENTRIES = 3
 ACTION_LINE_THEME_STATE_SIZE = 0x20
+ACTION_LINE_THEME_PALETTE_MASK = 0xFF
+ACTION_LINE_THEME_OUT_OF_RANGE = 0x100
 
 
 def _rel32(source: int, size: int, target: int) -> bytes:
@@ -36,9 +38,6 @@ def build_action_line_theme_cave(cave: int, state: int) -> bytes:
         fixups.append((len(code), label))
         code.extend(b"\x00" * 4)
 
-    code += b"\x83\xf8\x04"
-    branch(b"\x0f\x84", "done")
-
     code += b"\x49\xba" + struct.pack("<Q", state)
     code += b"\x45\x8b\x1a"
     code += b"\x45\x85\xdb"
@@ -47,9 +46,17 @@ def build_action_line_theme_cave(cave: int, state: int) -> bytes:
 
     code += b"\x41\x3b\x52\x08"
     branch(b"\x0f\x85", "check_1")
+    code += b"\x83\xf8\x04"
+    branch(b"\x0f\x84", "warning_0")
+    code += b"\x41\x81\x62\x0c" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
     code += b"\x41\x83\x7a\x0c\x04"
     branch(b"\x0f\x84", "done")
     code += b"\x41\x8b\x42\x0c"
+    code += b"\x25" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
+    branch(b"\xe9", "done")
+
+    labels["warning_0"] = len(code)
+    code += b"\x41\x81\x4a\x0c" + struct.pack("<I", ACTION_LINE_THEME_OUT_OF_RANGE)
     branch(b"\xe9", "done")
 
     labels["check_1"] = len(code)
@@ -57,9 +64,17 @@ def build_action_line_theme_cave(cave: int, state: int) -> bytes:
     branch(b"\x0f\x82", "done")
     code += b"\x41\x3b\x52\x10"
     branch(b"\x0f\x85", "check_2")
+    code += b"\x83\xf8\x04"
+    branch(b"\x0f\x84", "warning_1")
+    code += b"\x41\x81\x62\x14" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
     code += b"\x41\x83\x7a\x14\x04"
     branch(b"\x0f\x84", "done")
     code += b"\x41\x8b\x42\x14"
+    code += b"\x25" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
+    branch(b"\xe9", "done")
+
+    labels["warning_1"] = len(code)
+    code += b"\x41\x81\x4a\x14" + struct.pack("<I", ACTION_LINE_THEME_OUT_OF_RANGE)
     branch(b"\xe9", "done")
 
     labels["check_2"] = len(code)
@@ -67,9 +82,17 @@ def build_action_line_theme_cave(cave: int, state: int) -> bytes:
     branch(b"\x0f\x82", "done")
     code += b"\x41\x3b\x52\x18"
     branch(b"\x0f\x85", "done")
+    code += b"\x83\xf8\x04"
+    branch(b"\x0f\x84", "warning_2")
+    code += b"\x41\x81\x62\x1c" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
     code += b"\x41\x83\x7a\x1c\x04"
     branch(b"\x0f\x84", "done")
     code += b"\x41\x8b\x42\x1c"
+    code += b"\x25" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
+    branch(b"\xe9", "done")
+
+    labels["warning_2"] = len(code)
+    code += b"\x41\x81\x4a\x1c" + struct.pack("<I", ACTION_LINE_THEME_OUT_OF_RANGE)
 
     labels["done"] = len(code)
     code += ACTION_LINE_RENDER_ORIGINAL
@@ -103,6 +126,9 @@ def build_action_targetline_theme_cave(cave: int, state: int) -> bytes:
     code += b"\x45\x3b\x42\x08"
     branch(b"\x0f\x85", "check_1")
     code += b"\x41\x8b\x42\x0c"
+    code += b"\xa9" + struct.pack("<I", ACTION_LINE_THEME_OUT_OF_RANGE)
+    branch(b"\x0f\x85", "warning")
+    code += b"\x25" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
     branch(b"\xe9", "done")
 
     labels["check_1"] = len(code)
@@ -111,6 +137,9 @@ def build_action_targetline_theme_cave(cave: int, state: int) -> bytes:
     code += b"\x45\x3b\x42\x10"
     branch(b"\x0f\x85", "check_2")
     code += b"\x41\x8b\x42\x14"
+    code += b"\xa9" + struct.pack("<I", ACTION_LINE_THEME_OUT_OF_RANGE)
+    branch(b"\x0f\x85", "warning")
+    code += b"\x25" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
     branch(b"\xe9", "done")
 
     labels["check_2"] = len(code)
@@ -119,6 +148,16 @@ def build_action_targetline_theme_cave(cave: int, state: int) -> bytes:
     code += b"\x45\x3b\x42\x18"
     branch(b"\x0f\x85", "done")
     code += b"\x41\x8b\x42\x1c"
+    code += b"\xa9" + struct.pack("<I", ACTION_LINE_THEME_OUT_OF_RANGE)
+    branch(b"\x0f\x85", "warning")
+    code += b"\x25" + struct.pack("<I", ACTION_LINE_THEME_PALETTE_MASK)
+    branch(b"\xe9", "done")
+
+    # The target-line builder does not receive the native range result.  The
+    # arrow renderer publishes it in the high bit of the same atomic palette
+    # row, allowing both native draw paths to preserve warning red together.
+    labels["warning"] = len(code)
+    code += b"\xb8\x04\x00\x00\x00"
 
     labels["done"] = len(code)
     code += ACTION_TARGETLINE_RENDER_ORIGINAL

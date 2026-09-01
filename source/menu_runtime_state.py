@@ -69,6 +69,11 @@ class PendingCombatIndicator:
 class PlayerMenuInput:
     up: bool = False
     down: bool = False
+    # ``None`` keeps direct/test callers compatible with a fresh press.  The
+    # production sampler always publishes True for the initial edge and False
+    # for delayed repeats while the direction remains held.
+    up_edge: bool | None = None
+    down_edge: bool | None = None
     left: bool = False
     right: bool = False
     page_up: bool = False

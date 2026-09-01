@@ -189,6 +189,7 @@ def desktop_input_runtime(tmp_path):
     runtime.native_frontend_suspended_battle_info = 0
     runtime.native_frontend_suspended_role_generation = 0
     runtime.unexpected_native_menu_cancel_latched = False
+    runtime.unexpected_native_menu_cancel_retry_at = 0.0
     runtime.native_party_menu_active = False
     runtime.native_party_menu_request_pending = False
     runtime.p1_visual_replacement = False
@@ -1609,6 +1610,54 @@ def test_forbidden_native_frontend_instance_never_ages_into_external_trust(
     bridge.pulse.assert_called_once_with(live.NATIVE_DIALOG_CANCEL)
 
 
+def test_script_forced_native_command_retries_cancel_then_opens_custom_tree(
+    desktop_input_runtime,
+):
+    runtime, bridge, _process, _observed_inputs = desktop_input_runtime
+    snapshot = runtime.session_snapshot
+    runtime.p1_visual_replacement = True
+    snapshot.bridge_ownership_allowed = True
+    snapshot.native_menu_open = True
+    bridge.pulse = mock.Mock()
+    runtime.p1_native_lifecycle.return_value = (0x1000, 0x2000, 0x1000)
+
+    with mock.patch.object(live.time, "monotonic", return_value=10.0):
+        runtime.input(True, native_pause_open=False)
+
+    bridge.pulse.assert_called_once_with(live.NATIVE_DIALOG_CANCEL)
+    assert runtime.unexpected_native_menu_cancel_latched
+    assert runtime.p1_frontend_deferred_open_until == pytest.approx(
+        10.0 + live.P1_FRONTEND_DEFERRED_OPEN_SECONDS
+    )
+
+    # A tutorial-owned COMMAND can ignore the first synthetic cancel. Keep the
+    # same provenance quarantined and retry at a bounded cadence rather than
+    # stranding the player behind an F8-only escape path.
+    with mock.patch.object(live.time, "monotonic", return_value=10.10):
+        runtime.input(True, native_pause_open=False)
+    bridge.pulse.assert_called_once_with(live.NATIVE_DIALOG_CANCEL)
+
+    retry_at = 10.0 + live.UNEXPECTED_NATIVE_COMMAND_CANCEL_RETRY_SECONDS
+    with mock.patch.object(live.time, "monotonic", return_value=retry_at):
+        runtime.input(True, native_pause_open=False)
+    assert bridge.pulse.call_args_list == [
+        mock.call(live.NATIVE_DIALOG_CANCEL),
+        mock.call(live.NATIVE_DIALOG_CANCEL),
+    ]
+
+    # As soon as the native tree acknowledges close, the original scripted
+    # request becomes a custom P1 open without requiring a second user press.
+    snapshot.native_menu_open = False
+    runtime.p1_native_lifecycle.return_value = None
+    runtime.maintain_native_frontend_suspension(snapshot, now=retry_at + 0.01)
+    with mock.patch.object(live.time, "monotonic", return_value=retry_at + 0.01):
+        runtime.input(True, native_pause_open=False)
+    routed = runtime._handle_p1_battle_input.call_args.kwargs
+    assert routed["controls"].confirm
+    assert not runtime.unexpected_native_menu_cancel_latched
+    assert runtime.p1_frontend_deferred_open_until == 0.0
+
+
 def test_stable_external_frontend_requires_clear_edge_and_settle_before_passthrough(
     desktop_input_runtime,
 ):
@@ -2019,6 +2068,29 @@ def test_first_p1_direction_opens_leader_selector_without_advancing_anchor(
     runtime.dispatch_p1.assert_not_called()
 
 
+def test_open_p1_leader_selector_keeps_only_native_turbo_unmasked(
+    desktop_input_runtime,
+):
+    runtime, bridge, _process, _observed_inputs = desktop_input_runtime
+    runtime.session_snapshot.bridge_ownership_allowed = True
+    runtime.p1_model = SimpleNamespace(
+        mode=MenuMode.TARGET,
+        pending_action=SimpleNamespace(
+            action_id=live.P1_CHANGE_LEADER_ACTION_ID,
+        ),
+    )
+
+    runtime.input(True, native_pause_open=False)
+
+    assert not bridge.policy.p1_semantic_mask & live.NATIVE_INPUT_LB_MASK
+    assert (
+        bridge.policy.p1_semantic_mask
+        & live.NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK
+        == live.NATIVE_INPUT_P1_CUSTOM_DIRECTION_MASK
+    )
+    assert bridge.policy.other_semantic_mask & live.NATIVE_INPUT_LB_MASK
+
+
 def test_p1_direction_held_through_pause_requires_release_before_opening(
     desktop_input_runtime,
 ):
@@ -2090,6 +2162,16 @@ def test_p1_horizontal_aliases_never_open_the_leader_selector(
         runtime.input(True, native_pause_open=False)
 
     runtime.open_p1_leader_selector.assert_not_called()
+
+
+def test_held_vertical_repeat_uses_bounded_commands_until_release():
+    assert live.vertical_input_command(-1, True) is InputCommand.UP
+    assert live.vertical_input_command(1, True) is InputCommand.DOWN
+    assert live.vertical_input_command(-1, False) is InputCommand.UP_REPEAT
+    assert live.vertical_input_command(1, False) is InputCommand.DOWN_REPEAT
+    # Direct callers which do not expose edge metadata remain fresh presses.
+    assert live.vertical_input_command(-1, None) is InputCommand.UP
+    assert live.vertical_input_command(1, None) is InputCommand.DOWN
 
 
 @pytest.mark.parametrize(
@@ -2491,6 +2573,9 @@ def test_p1_physical_pause_never_receives_a_synthetic_duplicate(
 ):
     runtime, bridge, _process, _observed_inputs = desktop_input_runtime
     bridge.pulse = mock.Mock()
+    runtime.native_pause_visibility_gate = mock.Mock(
+        spec=live.NativePauseVisibilityGate
+    )
 
     def edge(candidate, action):
         return candidate == "p1" and action == "native_pause"
@@ -2499,6 +2584,7 @@ def test_p1_physical_pause_never_receives_a_synthetic_duplicate(
         runtime.input(True, native_pause_open=False)
 
     bridge.pulse.assert_not_called()
+    runtime.native_pause_visibility_gate.arm.assert_called_once()
 
 
 @pytest.mark.parametrize("follower", ("p2", "p3"))

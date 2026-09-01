@@ -159,6 +159,9 @@ class TargetView:
 
     show_party_names: bool = False
 
+    cursor_position: float | None = None
+    cursor_trail: tuple[tuple[float, float], ...] = ()
+
     # Indices other than selected_index which the pending area action will
     # also affect.  They remain presentation-only: submission still uses the
     # single selected target.
@@ -1306,7 +1309,38 @@ def render_target(
                         cursor_y,
                     )
                 )
-        cursor_y = top + 50 + (selected - first) * ROW_PITCH + CURSOR_Y_OFFSET
+        for trail_position, trail_opacity in view.cursor_trail:
+            ghost = _cursor_ghost(int(round(float(trail_opacity) * 15.0)))
+            if ghost is None:
+                continue
+            cursor_y = int(
+                round(
+                    top
+                    + 50
+                    + (float(trail_position) - first) * ROW_PITCH
+                    + CURSOR_Y_OFFSET
+                )
+            )
+            dynamic_layers.append(
+                (
+                    ghost,
+                    CURSOR_X_OFFSET + int(round(cursor_jab(now))),
+                    cursor_y,
+                )
+            )
+        cursor_position = (
+            float(selected)
+            if view.cursor_position is None
+            else float(view.cursor_position)
+        )
+        cursor_y = int(
+            round(
+                top
+                + 50
+                + (cursor_position - first) * ROW_PITCH
+                + CURSOR_Y_OFFSET
+            )
+        )
         dynamic_layers.append(
             (
                 _cursor(),

@@ -95,6 +95,20 @@ PENELO_ID = 5
 ASHE_ID = 1
 BALTHIER_ID = 3
 MAIN_MEMBER_IDS = frozenset(range(6))
+# These are story actors, never co-op player seats. Separate aliases matter
+# because FF12 rebuilds them as distinct party records across story phases.
+STORY_GUEST_MEMBERS = {
+    6: "Reks",
+    7: "Amalia/Ashe",
+    8: "Basch (Prisoner)",
+    9: "Basch (Fugitive)",
+    10: "Lamont",
+    11: "Vossler (Judge)",
+    12: "Vossler (Knight)",
+    13: "Larsa",
+    14: "Reddas",
+}
+STORY_GUEST_MEMBER_IDS = frozenset(STORY_GUEST_MEMBERS)
 
 
 def _protected_member_ids() -> tuple[int, ...]:
@@ -113,6 +127,7 @@ POLL_SECONDS = 0.20
 TRANSIENT_LOG_INTERVAL_SECONDS = 30.0
 REPAIR_DEBOUNCE_SECONDS = 1.25
 POST_REPAIR_COOLDOWN_SECONDS = 4.0
+GUEST_PARTY_EDIT_SETTLE_SECONDS = 4.0
 REMOTE_CALL_WAIT_SLICE_MS = 250
 REMOTE_CALL_MAX_WAIT_SECONDS = 30.0
 WAIT_OBJECT_0 = 0x00000000
@@ -214,6 +229,47 @@ def active_main_members(slots: tuple[int, ...]) -> tuple[int, ...] | None:
     return members
 
 
+def coherent_story_guest_members(
+    layouts: tuple[tuple[int, ...], ...],
+) -> tuple[int, ...]:
+    """Return persistent guests only when Default and Menu agree exactly."""
+
+    if len(layouts) != PARTY_LAYOUT_COUNT:
+        return ()
+    persistent_guests = []
+    for layout_id in (DEFAULT_LAYOUT, MENU_LAYOUT):
+        layout = layouts[layout_id]
+        if len(layout) != 9:
+            return ()
+        persistent_guests.append(
+            tuple(
+                member_id
+                for member_id in layout
+                if member_id in STORY_GUEST_MEMBER_IDS
+            )
+        )
+    if persistent_guests[0] != persistent_guests[1]:
+        return ()
+    return persistent_guests[0]
+
+
+def guest_party_edit_cooldown_until(
+    current_cooldown: float,
+    layouts: tuple[tuple[int, ...], ...],
+    *,
+    manual_adopted: bool,
+    now: float,
+) -> float:
+    """Let FF12 finish rebuilding guest actors after an explicit Party edit."""
+
+    if not manual_adopted or not coherent_story_guest_members(layouts):
+        return float(current_cooldown)
+    return max(
+        float(current_cooldown),
+        float(now) + GUEST_PARTY_EDIT_SETTLE_SECONDS,
+    )
+
+
 def coherent_active_main_members(
     layouts: tuple[tuple[int, ...], ...],
 ) -> tuple[int, ...] | None:
@@ -228,6 +284,45 @@ def coherent_active_main_members(
     if any(set(formation) != expected for formation in formations[1:]):
         return None
     return formations[0]
+
+
+def coherent_temporary_summon(
+    layouts: tuple[tuple[int, ...], ...],
+) -> bool:
+    """Recognize the native summoner-plus-Esper materialization."""
+
+    if len(layouts) < PARTY_LAYOUT_COUNT:
+        return False
+    current = layouts[CURRENT_LAYOUT]
+    ui = layouts[UI_LAYOUT]
+    current_espers = {
+        member_id
+        for member_id in current[:ACTIVE_STORAGE_SLOTS]
+        if member_id in coop.session_state.ESPER_PARTY_MEMBER_IDS
+    }
+    ui_espers = {
+        member_id
+        for member_id in ui[:ACTIVE_STORAGE_SLOTS]
+        if member_id in coop.session_state.ESPER_PARTY_MEMBER_IDS
+    }
+    current_main = {
+        member_id
+        for member_id in current[:ACTIVE_STORAGE_SLOTS]
+        if member_id in MAIN_MEMBER_IDS
+    }
+    ui_main = {
+        member_id
+        for member_id in ui[:ACTIVE_STORAGE_SLOTS]
+        if member_id in MAIN_MEMBER_IDS
+    }
+    return bool(
+        len(current_espers) == 1
+        and current_espers == ui_espers
+        and current_main
+        and current_main == ui_main
+        and layout_has_unique_members(current)
+        and layout_has_unique_members(ui)
+    )
 
 
 def apply_active_main_members(
@@ -684,6 +779,7 @@ class PeneloStoryGuard:
             self.bad_signature = None
             self.bad_since = 0.0
             self.cooldown_until = 0.0
+            self.temporary_summon_active = False
         except Exception:
             self.close()
             raise
@@ -722,6 +818,7 @@ class PeneloStoryGuard:
         self.pending_story_restore.clear()
         self.story_removal_watches.clear()
         self.last_active_anomaly = None
+        self.temporary_summon_active = False
         try:
             self.story_removal_counters = self.story_removal_journal.snapshot()
         except OSError:
@@ -1209,11 +1306,49 @@ class PeneloStoryGuard:
         signature = self.signature(base)
         layouts = signature[1]
         story_counters = self.story_removal_journal.snapshot()
+        summon_active = coherent_temporary_summon(layouts)
+        if summon_active:
+            if not getattr(self, "temporary_summon_active", False):
+                print(
+                    "PENELO_GUARD suspended: native summon materialization",
+                    flush=True,
+                )
+            self.temporary_summon_active = True
+            self.story_removal_counters = story_counters
+            self.story_removal_watches.clear()
+            self.bad_signature = None
+            self.bad_since = 0.0
+            return
+        if getattr(self, "temporary_summon_active", False):
+            self.temporary_summon_active = False
+            self.story_removal_counters = story_counters
+            self.story_removal_watches.clear()
+            self.bad_signature = None
+            self.bad_since = 0.0
+            self.cooldown_until = now + REPAIR_DEBOUNCE_SECONDS
+            print("PENELO_GUARD resumed after summon", flush=True)
+            return
         manual_adopted = self.consume_manual_party_intent(
             base,
             layouts,
             story_counters,
         )
+        guest_settle_until = guest_party_edit_cooldown_until(
+            self.cooldown_until,
+            layouts,
+            manual_adopted=manual_adopted,
+            now=now,
+        )
+        if guest_settle_until != self.cooldown_until:
+            guests = coherent_story_guest_members(layouts)
+            self.cooldown_until = guest_settle_until
+            self.bad_signature = None
+            self.bad_since = 0.0
+            print(
+                "PARTY_GUEST_REBUILD_SETTLE "
+                f"members={','.join(map(str, guests))}",
+                flush=True,
+            )
         if not manual_adopted and not just_armed:
             self.observe_story_removals(
                 layouts,

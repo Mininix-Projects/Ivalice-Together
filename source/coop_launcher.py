@@ -264,6 +264,7 @@ class LauncherApp:
         self._native_icon_handles: tuple[int, ...] = ()
         self.tray: launcher_tray.WindowsTrayIcon | None = None
         self.in_tray = False
+        self.taskbar_minimized = False
 
         self._set_icon()
         if not pygame.joystick.get_init():
@@ -541,9 +542,39 @@ class LauncherApp:
             return False
         ctypes.windll.user32.ShowWindow(hwnd, 0)
         self.in_tray = True
+        self.taskbar_minimized = False
         self.window_focused = False
         self.suspend_controller_discovery()
         return True
+
+    def minimize_to_taskbar(self) -> None:
+        """Minimize normally without removing the window from the taskbar."""
+
+        if self.in_tray:
+            if self.tray is not None:
+                self.tray.hide()
+            self.in_tray = False
+        hwnd = self.native_window_handle()
+        if hwnd:
+            ctypes.windll.user32.ShowWindowAsync(hwnd, 6)
+        else:
+            pygame.display.iconify()
+        self.taskbar_minimized = True
+        self.window_focused = False
+        self.suspend_controller_discovery()
+
+    def restore_from_taskbar(self) -> None:
+        if not self.taskbar_minimized:
+            return
+        hwnd = self.native_window_handle()
+        if hwnd:
+            user32 = ctypes.windll.user32
+            user32.ShowWindowAsync(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+        self.taskbar_minimized = False
+        self.window_focused = True
+        self.resume_controller_discovery()
+        self.scene_dirty = True
 
     def restore_from_tray(self) -> None:
         if not self.in_tray:
@@ -557,6 +588,7 @@ class LauncherApp:
             user32.ShowWindowAsync(hwnd, 5)
             user32.SetForegroundWindow(hwnd)
         self.in_tray = False
+        self.taskbar_minimized = False
         self.window_focused = True
         self.resume_controller_discovery()
         self.scene_dirty = True
@@ -3605,6 +3637,8 @@ class LauncherApp:
             if was_open and not game_open:
                 if self.in_tray:
                     self.restore_from_tray()
+                elif self.taskbar_minimized:
+                    self.restore_from_taskbar()
                 else:
                     changed = self.resume_controller_discovery() or changed
             changed = game_open != was_open or changed
@@ -3627,18 +3661,24 @@ class LauncherApp:
             changed = True
             if event.kind == "error":
                 self.audio.play("error")
-                self.restore_from_tray()
+                if self.in_tray:
+                    self.restore_from_tray()
+                elif self.taskbar_minimized:
+                    self.restore_from_taskbar()
             elif event.kind == "ready":
                 auto_minimize = (
                     bool(self.config.get("minimize_when_ready", True))
                     and not self.preview
                 )
                 if auto_minimize:
-                    self.hide_to_tray()
+                    self.minimize_to_taskbar()
                 else:
                     self.audio.play("confirm")
             elif event.kind == "idle":
-                self.restore_from_tray()
+                if self.in_tray:
+                    self.restore_from_tray()
+                elif self.taskbar_minimized:
+                    self.restore_from_taskbar()
         return changed
 
     def prepare_navigation_visuals(self, now: float) -> None:
@@ -3646,6 +3686,7 @@ class LauncherApp:
 
     def run(self) -> int:
         minimized_event = getattr(pygame, "WINDOWMINIMIZED", -1)
+        restored_event = getattr(pygame, "WINDOWRESTORED", -1)
         focus_lost_event = getattr(pygame, "WINDOWFOCUSLOST", -1)
         focus_gained_event = getattr(pygame, "WINDOWFOCUSGAINED", -1)
         controller_added_event = getattr(pygame, "CONTROLLERDEVICEADDED", -2)
@@ -3687,15 +3728,18 @@ class LauncherApp:
                     self.last_controller_state_poll = now
                     redraw = True
                 elif event.type == minimized_event:
-                    self.hide_to_tray()
+                    self.minimize_to_taskbar()
                 elif event.type == focus_lost_event:
                     self.window_focused = False
                     self.suspend_controller_discovery()
                 elif event.type == focus_gained_event:
+                    self.taskbar_minimized = False
                     self.window_focused = True
                     if self.resume_controller_discovery():
                         redraw = True
                 elif event.type in redraw_events:
+                    if event.type == restored_event:
+                        self.taskbar_minimized = False
                     if event.type in resize_events:
                         self.enforce_minimum_window_size()
                     redraw = True
@@ -3717,7 +3761,7 @@ class LauncherApp:
                 redraw = True
             if redraw:
                 self.scene_dirty = True
-            if self.in_tray:
+            if self.in_tray or self.taskbar_minimized:
                 self.clock.tick(TRAY_POLL_FPS)
                 continue
             self.render(now)

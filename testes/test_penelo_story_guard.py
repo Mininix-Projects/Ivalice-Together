@@ -713,6 +713,98 @@ class GuestSlotTests(unittest.TestCase):
         stray[4] = displaced
         self.assertFalse(PeneloStoryGuard.healthy(self.signature(tuple(stray))))
 
+    def test_every_story_guest_defers_full_actor_rebuild_after_party_edit(self):
+        expected_guests = {
+            6: "Reks",
+            7: "Amalia/Ashe",
+            8: "Basch (Prisoner)",
+            9: "Basch (Fugitive)",
+            10: "Lamont",
+            11: "Vossler (Judge)",
+            12: "Vossler (Knight)",
+            13: "Larsa",
+            14: "Reddas",
+        }
+        self.assertEqual(guard.STORY_GUEST_MEMBERS, expected_guests)
+
+        for guest, name in expected_guests.items():
+            with self.subTest(guest=guest, name=name):
+                persistent = (
+                    VAAN_ID,
+                    PENELO_ID,
+                    EMPTY,
+                    guest,
+                    *([EMPTY] * 5),
+                )
+                layouts = (
+                    persistent,
+                    persistent,
+                    persistent,
+                    persistent,
+                    persistent,
+                )
+
+                self.assertEqual(
+                    guard.coherent_story_guest_members(layouts),
+                    (guest,),
+                )
+                self.assertEqual(
+                    guard.guest_party_edit_cooldown_until(
+                        2.0,
+                        layouts,
+                        manual_adopted=True,
+                        now=10.0,
+                    ),
+                    10.0 + guard.GUEST_PARTY_EDIT_SETTLE_SECONDS,
+                )
+                self.assertEqual(
+                    guard.guest_party_edit_cooldown_until(
+                        2.0,
+                        layouts,
+                        manual_adopted=False,
+                        now=10.0,
+                    ),
+                    2.0,
+                )
+
+    def test_non_story_temporary_actors_do_not_arm_guest_rebuild_settle(self):
+        for temporary_actor in (26, 27, 39):
+            with self.subTest(temporary_actor=temporary_actor):
+                layout = (
+                    VAAN_ID,
+                    PENELO_ID,
+                    EMPTY,
+                    temporary_actor,
+                    *([EMPTY] * 5),
+                )
+                layouts = (layout, layout, layout, layout, layout)
+                self.assertEqual(guard.coherent_story_guest_members(layouts), ())
+                self.assertEqual(
+                    guard.guest_party_edit_cooldown_until(
+                        2.0,
+                        layouts,
+                        manual_adopted=True,
+                        now=10.0,
+                    ),
+                    2.0,
+                )
+
+    def test_torn_guest_generations_never_arm_party_rebuild_cooldown(self):
+        default = (VAAN_ID, PENELO_ID, EMPTY, 11, *([EMPTY] * 5))
+        menu = (VAAN_ID, PENELO_ID, EMPTY, 13, *([EMPTY] * 5))
+        layouts = (default, default, default, menu, default)
+
+        self.assertEqual(guard.coherent_story_guest_members(layouts), ())
+        self.assertEqual(
+            guard.guest_party_edit_cooldown_until(
+                3.0,
+                layouts,
+                manual_adopted=True,
+                now=10.0,
+            ),
+            3.0,
+        )
+
 
 def test_adds_penelo_after_vaan():
     result = normalize_penelo(

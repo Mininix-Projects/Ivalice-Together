@@ -69,6 +69,37 @@ class MenuModelTests(unittest.TestCase):
         self.assertEqual(self.model.index, 0)
         self.assertEqual(self.model.selected_entry.name, "Attack")
 
+    def test_held_list_repeat_stops_at_boundary_but_next_press_wraps(self):
+        self.model.open()
+
+        self.assertEqual(self.model.navigate(-1, wrap=False).kind, "ignored")
+        self.assertEqual(self.model.index, 0)
+        wrapped = self.model.navigate(-1)
+
+        self.assertEqual(wrapped.kind, "cursor_moved")
+        self.assertEqual(self.model.index, len(self.model.page.entries) - 1)
+        self.assertEqual(self.model.navigate(1, wrap=False).kind, "ignored")
+        self.assertEqual(self.model.index, len(self.model.page.entries) - 1)
+        self.assertEqual(self.model.navigate(1).value, 0)
+
+    def test_held_target_repeat_stops_at_boundary_but_next_press_wraps(self):
+        second_foe = FOE + 1
+        self.model.set_candidates(
+            (
+                TargetCandidate(FOE, "Foe A", TargetGroup.FOES),
+                TargetCandidate(second_foe, "Foe B", TargetGroup.FOES),
+            )
+        )
+        self.model.open()
+        self.model.confirm()
+
+        self.assertEqual(self.model.navigate(-1, wrap=False).kind, "ignored")
+        self.assertEqual(self.model.target_index, 0)
+        self.assertEqual(self.model.navigate(-1).value, 1)
+        self.assertEqual(self.model.navigate(1, wrap=False).kind, "ignored")
+        self.assertEqual(self.model.target_index, 1)
+        self.assertEqual(self.model.navigate(1).value, 0)
+
     def test_page_navigation_moves_by_visible_rows_and_never_wraps(self):
         entries = tuple(
             MenuEntry(str(index), "", EntryKind.ACTION) for index in range(12)

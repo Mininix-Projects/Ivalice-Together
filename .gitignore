@@ -19,9 +19,43 @@ Desktop.ini
 .env
 .env.*
 
-# Generated build and release output
+# Local research, captures, archives, and generated output
 artefatos/
+capturas/
+codigo_nativo_antigo/
+*_arquivado/
+documentacao_interna/
+prototipos/
 publicacao/
+recursos_extraidos/
+temporario/
+validacao_visual/
+validacao_instalacao_limpa_*/
+resultado_testes_completo.txt
+resultado_auditoria_*.txt
+
+# Development utilities are private by default. Keep only reproducible build
+# and validation entry points under version control.
+ferramentas/*
+!ferramentas/audit_release_source.py
+!ferramentas/add_party_member.py
+!ferramentas/analyze_action_queue_trace.py
+!ferramentas/build_public_release.py
+!ferramentas/controller_config_gui.py
+!ferramentas/headless_targeting.py
+!ferramentas/interaction_transaction_model.py
+!ferramentas/live_inventory.py
+!ferramentas/menu_builder_snapshot_trace.py
+!ferramentas/menu_native_snapshot.py
+!ferramentas/native_damage_glyph_capture.py
+!ferramentas/native_menu_catalog_provider.py
+!ferramentas/native_menu_trace_merge.py
+!ferramentas/native_queue_analysis.py
+!ferramentas/native_render_object_create_capture.py
+!ferramentas/native_sprite_draw_capture.py
+!ferramentas/p2_native_catalog_pages.py
+!ferramentas/run_source_checks.ps1
+!ferramentas/tool_theme.py
 
 # Native build products
 fontes_nativos/build*/
@@ -44,7 +78,8 @@ source/*.bin
 source/*.log
 source/*.json
 
-# Local game assets are intentionally excluded from source control.
+# Assets extracted from or derived from the installed game are intentionally
+# not stored in source control. The local build workspace supplies them.
 source/assets/
 source/extracted_ui_assets/
 source/extracted_ui_assets_png/

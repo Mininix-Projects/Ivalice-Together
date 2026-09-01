@@ -68,6 +68,23 @@ class FrontendControllerTests(unittest.TestCase):
         self.controller.dispatch(InputCommand.BACK)
         self.assertEqual(self.requests, [])
 
+    def test_repeat_commands_stop_at_boundaries_and_fresh_commands_wrap(self):
+        self.controller.dispatch(InputCommand.TOGGLE)
+
+        self.assertEqual(
+            self.controller.dispatch(InputCommand.UP_REPEAT).event.kind,
+            "ignored",
+        )
+        self.assertEqual(self.model.index, 0)
+        self.controller.dispatch(InputCommand.UP)
+        self.assertEqual(self.model.index, len(self.model.page.entries) - 1)
+        self.assertEqual(
+            self.controller.dispatch(InputCommand.DOWN_REPEAT).event.kind,
+            "ignored",
+        )
+        self.controller.dispatch(InputCommand.DOWN)
+        self.assertEqual(self.model.index, 0)
+
     def test_page_commands_use_the_presented_row_count(self):
         entries = tuple(
             MenuEntry(str(index), "", EntryKind.ACTION) for index in range(12)
