@@ -257,6 +257,61 @@ def test_p1_swap_with_active_p3_preserves_unrelated_off_party_p2_role():
     assert transfer.p3_hud_slot == 1
 
 
+def test_p1_swap_with_p3_preserves_an_empty_p2_seat():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    layout = (0, 1, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+    current_identity = session_state.SessionIdentity(0, None, 1, 3)
+
+    sequence, replacement = coop.request_native_leader_role_transfer(
+        process,
+        1,
+        current_identity,
+        layout,
+        layout,
+        manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+    )
+
+    assert sequence == 1
+    assert replacement == session_state.SessionIdentity(1, None, 0, 3)
+    assert process.u32(
+        coop.P2_DEVICE_FILTER_STATE + coop.NATIVE_LEADER_ROLE_P2_OFFSET
+    ) == coop.NATIVE_LEADER_ROLE_NONE
+    transfer = coop.read_native_leader_role_transfer(process)
+    assert transfer is not None
+    assert transfer.identity == replacement
+    assert transfer.p1_hud_slot == 1
+    assert transfer.p2_hud_slot == coop.INVALID_HUD_PARTY_SLOT
+    assert transfer.p3_hud_slot == 0
+
+
+def test_empty_p3_preserves_three_player_capacity_through_role_transfer():
+    coop.set_cave_base(MAIN_BASE)
+    coop.set_dual_interaction_base(DUAL_BASE)
+    process = SparseProcess()
+    layout = (0, 5, session_state.EMPTY_PARTY_ID, session_state.EMPTY_PARTY_ID)
+    current_identity = session_state.SessionIdentity(0, 5, None, 3)
+
+    _sequence, replacement = coop.request_native_leader_role_transfer(
+        process,
+        5,
+        current_identity,
+        layout,
+        layout,
+        manual_control_mask=coop.DEFAULT_MANUAL_CONTROL_MASK,
+    )
+
+    assert replacement == session_state.SessionIdentity(5, 0, None, 3)
+    assert process.u32(
+        coop.P2_DEVICE_FILTER_STATE + coop.NATIVE_LEADER_ROLE_P3_OFFSET
+    ) == coop.NATIVE_LEADER_ROLE_EMPTY_P3
+    transfer = coop.read_native_leader_role_transfer(process)
+    assert transfer is not None
+    assert transfer.identity == replacement
+    assert transfer.identity.player_count == 3
+
+
 def test_p1_swap_with_active_p2_preserves_unrelated_off_party_p3_role():
     coop.set_cave_base(MAIN_BASE)
     coop.set_dual_interaction_base(DUAL_BASE)

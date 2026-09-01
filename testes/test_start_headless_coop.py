@@ -2650,7 +2650,7 @@ class HeadlessLauncherPartyTests(unittest.TestCase):
         self.assertEqual(role_members, {"p1": 0, "p2": 5})
         self.assertEqual(role_slots, {"p1": 0, "p2": 1})
 
-    def test_main_party_solo_keeps_configured_followers_latent(self):
+    def test_main_party_solo_exposes_only_the_live_player_role(self):
         configured = launcher.session_state.SessionIdentity(5, 4, 3)
         penelo_only = (5, 0xFFFF, 0xFFFF, 0xFFFF) + (0xFFFF,) * 5
 
@@ -2661,19 +2661,8 @@ class HeadlessLauncherPartyTests(unittest.TestCase):
             leader=5,
         )
 
-        self.assertEqual(role_members, {"p1": 5, "p2": 4})
+        self.assertEqual(role_members, {"p1": 5})
         self.assertEqual(role_slots, {"p1": 0})
-
-    def test_latent_p3_never_replaces_the_live_p2_fallback(self):
-        configured = launcher.session_state.SessionIdentity(1, 4, 3)
-        live = launcher.session_state.SessionIdentity(0, 5)
-
-        actual = launcher.preserve_latent_third_player(configured, live)
-
-        self.assertEqual(
-            actual,
-            launcher.session_state.SessionIdentity(0, 5, 3),
-        )
 
     def test_final_commit_expects_basch_emerald_not_fallback_gold(self):
         selection = launcher.menu_themes.ThemeSelection(

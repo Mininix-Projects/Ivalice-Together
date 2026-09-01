@@ -101,24 +101,46 @@ def normalize_config(raw: Any) -> dict[str, Any]:
     players = raw.get("players")
     if not isinstance(players, dict):
         return result
-    values: dict[str, int] = {}
+    configured_player_count = 3 if "p3" in players else 2
+    try:
+        configured_player_count = int(raw.get("player_count", configured_player_count))
+    except (TypeError, ValueError):
+        configured_player_count = 2
+    configured_player_count = 3 if configured_player_count >= 3 else 2
+    result["player_count"] = configured_player_count
+
+    values: dict[str, int | None] = {}
     third = players.get("p3")
-    if isinstance(third, dict):
-        try:
-            third_id = int(third.get("party_member_id"))
-        except (TypeError, ValueError):
-            third_id = None
-        if third_id in MAIN_PARTY_MEMBER_IDS:
-            result["players"]["p3"] = {"party_member_id": third_id}
+    if configured_player_count >= 3:
+        third_id = None
+        if isinstance(third, dict):
+            try:
+                third_id = int(third.get("party_member_id"))
+            except (TypeError, ValueError):
+                third_id = None
+        result["players"]["p3"] = {
+            "party_member_id": (
+                third_id if third_id in MAIN_PARTY_MEMBER_IDS else None
+            )
+        }
     for player in ("p1", "p2"):
         source = players.get(player)
         if not isinstance(source, dict):
             continue
         try:
-            member_id = int(source.get("party_member_id"))
+            raw_member_id = source.get("party_member_id")
+            member_id = None if raw_member_id is None else int(raw_member_id)
         except (TypeError, ValueError):
             continue
-        if member_id in MAIN_PARTY_MEMBER_IDS:
+        if player == "p1" and member_id not in MAIN_PARTY_MEMBER_IDS:
+            continue
+        if (
+            player == "p2"
+            and member_id is not None
+            and member_id not in MAIN_PARTY_MEMBER_IDS
+        ):
+            continue
+        if member_id is None or member_id in MAIN_PARTY_MEMBER_IDS:
             values[player] = member_id
     for player, member_id in values.items():
         result["players"][player]["party_member_id"] = member_id
@@ -127,18 +149,13 @@ def normalize_config(raw: Any) -> dict[str, Any]:
         result["players"]["p1"]["party_member_id"]
         == result["players"]["p2"]["party_member_id"]
     ):
-        result["players"]["p2"]["party_member_id"] = 5
-        if (
-            result["players"]["p1"]["party_member_id"]
-            == result["players"]["p2"]["party_member_id"]
-        ):
-            result["players"]["p1"]["party_member_id"] = 0
+        result["players"]["p2"]["party_member_id"] = None
     third = result["players"].get("p3")
-    if third is not None and third["party_member_id"] in {
+    if third is not None and third.get("party_member_id") in {
         result["players"]["p1"]["party_member_id"],
         result["players"]["p2"]["party_member_id"],
     }:
-        del result["players"]["p3"]
+        third["party_member_id"] = None
     return result
 
 
@@ -156,13 +173,26 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
 def save_identity(identity: "SessionIdentity", path: Path = CONFIG_PATH) -> None:
     config = {
         "version": CONFIG_VERSION,
+        "player_count": identity.player_count,
         "players": {
             "p1": {"party_member_id": int(identity.p1_party_member_id)},
-            "p2": {"party_member_id": int(identity.p2_party_member_id)},
+            "p2": {
+                "party_member_id": (
+                    None
+                    if identity.p2_party_member_id is None
+                    else int(identity.p2_party_member_id)
+                )
+            },
         },
     }
-    if identity.p3_party_member_id is not None:
-        config["players"]["p3"] = {"party_member_id": int(identity.p3_party_member_id)}
+    if identity.player_count >= 3:
+        config["players"]["p3"] = {
+            "party_member_id": (
+                None
+                if identity.p3_party_member_id is None
+                else int(identity.p3_party_member_id)
+            )
+        }
     normalized = normalize_config(config)
     payload = json.dumps(normalized, indent=2, ensure_ascii=False) + "\n"
     atomic_files.write_text(path, payload, encoding="utf-8")
@@ -171,9 +201,17 @@ def save_identity(identity: "SessionIdentity", path: Path = CONFIG_PATH) -> None
 @dataclass(frozen=True)
 class SessionIdentity:
     p1_party_member_id: int = 0
-    p2_party_member_id: int = 5
-
+    p2_party_member_id: int | None = 5
     p3_party_member_id: int | None = None
+    seat_count: int = 2
+
+    def __post_init__(self) -> None:
+        normalized = (
+            3
+            if int(self.seat_count) >= 3 or self.p3_party_member_id is not None
+            else 2
+        )
+        object.__setattr__(self, "seat_count", normalized)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SessionIdentity":
@@ -182,15 +220,22 @@ class SessionIdentity:
         p3 = None
         if isinstance(third, dict) and third.get("party_member_id") is not None:
             p3 = int(third["party_member_id"])
+        raw_p2 = players["p2"].get("party_member_id")
+        player_count = (
+            3
+            if int(config.get("player_count", 3 if third is not None else 2)) >= 3
+            else 2
+        )
         return cls(
             int(players["p1"]["party_member_id"]),
-            int(players["p2"]["party_member_id"]),
+            None if raw_p2 is None else int(raw_p2),
             p3,
+            player_count,
         )
 
     @property
     def player_count(self) -> int:
-        return 3 if self.p3_party_member_id is not None else 2
+        return self.seat_count
 
     def member_id(self, player: str) -> int | None:
         return {
@@ -215,7 +260,10 @@ def ko_promoted_follower_role(
 ) -> str | None:
     if not p1_present or p1_alive is True:
         return None
-    if native_leader_member_id == identity.p2_party_member_id:
+    if (
+        identity.p2_party_member_id is not None
+        and native_leader_member_id == identity.p2_party_member_id
+    ):
         return "p2"
     if (
         identity.p3_party_member_id is not None
@@ -269,11 +317,8 @@ def available_identity(
     if p1 not in members:
         p1 = members[0]
 
-    configured_roles = [
-        configured.p1_party_member_id,
-        configured.p2_party_member_id,
-    ]
-    if configured.p3_party_member_id is not None:
+    configured_roles = [configured.p1_party_member_id, configured.p2_party_member_id]
+    if configured.player_count >= 3:
         configured_roles.append(configured.p3_party_member_id)
     resolved: list[int | None] = [p1] + [None] * (len(configured_roles) - 1)
     occupied = {p1}
@@ -309,18 +354,13 @@ def available_identity(
             occupied.add(member_id)
 
     p2 = resolved[1]
-    if p2 is None:
-        # Solo gameplay still needs a distinct persisted P2 placeholder so a
-        # later party expansion cannot alias both controls to the same member.
-        placeholders = (
-            configured.p2_party_member_id,
-            configured.p1_party_member_id,
-            5,
-            0,
-        )
-        p2 = next(member_id for member_id in placeholders if member_id != p1)
     p3 = resolved[2] if len(resolved) >= 3 else None
-    return SessionIdentity(int(p1), int(p2), None if p3 is None else int(p3))
+    return SessionIdentity(
+        int(p1),
+        None if p2 is None else int(p2),
+        None if p3 is None else int(p3),
+        configured.player_count,
+    )
 
 
 def active_main_party_members(layout: Sequence[int]) -> frozenset[int]:
@@ -385,7 +425,7 @@ def active_summon_owner_role(
     )
     if owner == identity.p1_party_member_id:
         return "p1"
-    if owner == identity.p2_party_member_id:
+    if identity.p2_party_member_id is not None and owner == identity.p2_party_member_id:
         return "p2"
     if identity.p3_party_member_id is not None and owner == identity.p3_party_member_id:
         return "p3"
@@ -565,34 +605,6 @@ def replacement_identity_for_live_party(
         ui_members,
         snapshot.leader_party_member_id,
     )
-    live_main_member_count = len(active_main_party_members(current_members))
-    if (
-        snapshot.identity.p3_party_member_id is not None
-        and live_main_member_count < 3
-        and replacement is not None
-        and replacement.p3_party_member_id is None
-    ):
-        occupied = {
-            replacement.p1_party_member_id,
-            replacement.p2_party_member_id,
-        }
-        latent_p3 = next(
-            (
-                member_id
-                for member_id in (
-                    snapshot.identity.p3_party_member_id,
-                    snapshot.identity.p1_party_member_id,
-                    snapshot.identity.p2_party_member_id,
-                )
-                if member_id in MAIN_PARTY_MEMBER_IDS and member_id not in occupied
-            ),
-            None,
-        )
-        replacement = SessionIdentity(
-            replacement.p1_party_member_id,
-            replacement.p2_party_member_id,
-            latent_p3,
-        )
     if replacement == snapshot.identity:
         return None
     return replacement
@@ -719,16 +731,28 @@ def read_snapshot(
         p1_role_present = (
             p1_owner_member_id in current_members and p1_owner_member_id in ui_members
         )
-        roles_present = (
-            p1_role_present
-            and identity.p2_party_member_id in current_members
-            and identity.p2_party_member_id in ui_members
+        follower_members = tuple(
+            member_id
+            for member_id in (
+                identity.p2_party_member_id,
+                identity.p3_party_member_id,
+            )
+            if member_id is not None
+        )
+        roles_present = bool(
+            follower_members
+            and p1_role_present
+            and all(
+                member_id in current_members and member_id in ui_members
+                for member_id in follower_members
+            )
         )
         p1_actor_present = (
             True if materialized_party_count is None else materialized_party_count >= 1
         )
-        actors_present = (
-            True if materialized_party_count is None else materialized_party_count >= 2
+        actors_present = bool(
+            materialized_party_count is None
+            or materialized_party_count >= 1 + len(follower_members)
         )
         location_coherent = (
             current_location != 0xFFFFFFFF
@@ -771,7 +795,7 @@ def read_snapshot(
         elif not location_coherent:
             reason = "loading: location generations disagree"
         elif not roles_present or not actors_present:
-            reason = "field: P2 unavailable"
+            reason = "field: no active follower"
         else:
             reason = "field"
     except (OSError, RuntimeError, struct.error, ValueError):
@@ -792,7 +816,10 @@ def read_snapshot(
     p1_is_leader = leader == p1_controlled_party_member_id(
         identity, current_layout, ui_layout, leader
     )
-    p2_is_leader = leader == identity.p2_party_member_id
+    p2_is_leader = bool(
+        identity.p2_party_member_id is not None
+        and leader == identity.p2_party_member_id
+    )
 
     if not loading:
         if native_menu_open:
@@ -822,6 +849,7 @@ def read_snapshot(
     )
     p2_menu_allowed = bool(
         gameplay_ready
+        and identity.p2_party_member_id is not None
         and control_enabled
         and not native_menu_open
         and not native_modal_active

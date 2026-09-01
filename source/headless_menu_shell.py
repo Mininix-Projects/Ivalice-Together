@@ -1234,19 +1234,26 @@ def p3_session_menu_allowed(
         if current_layout and ui_layout
         else None
     )
+    follower_ready = bool(
+        getattr(
+            snapshot,
+            "gameplay_ready",
+            getattr(snapshot, "p2_menu_allowed", False),
+        )
+        and getattr(snapshot, "user_control_enabled", True)
+        and not getattr(snapshot, "native_menu_open", False)
+        and not getattr(snapshot, "native_modal_active", False)
+        and not getattr(snapshot, "town", False)
+        and not getattr(snapshot, "chocobo_mode_active", False)
+    )
     if summon_owner_role == "p3":
         return bool(
-            snapshot.gameplay_ready
-            and snapshot.user_control_enabled
-            and not snapshot.native_menu_open
-            and not snapshot.native_modal_active
-            and not snapshot.town
-            and not snapshot.chocobo_mode_active
+            follower_ready
             and snapshot.identity.p3_party_member_id is not None
             and int(party_count) >= 1
         )
     return bool(
-        snapshot.p2_menu_allowed
+        follower_ready
         and summon_owner_role is None
         and snapshot.identity.p3_party_member_id is not None
         and int(party_count) >= 3
@@ -1325,7 +1332,11 @@ def native_party_menu_request_allowed(
     if player == "p1":
         return bool(snapshot.p1_gameplay_ready and party_count >= 1)
     if player == "p2":
-        return bool(snapshot.gameplay_ready and party_count >= 2)
+        return bool(
+            snapshot.gameplay_ready
+            and snapshot.identity.p2_party_member_id is not None
+            and party_count >= 2
+        )
     if player == "p3":
         return bool(
             snapshot.gameplay_ready
@@ -6543,7 +6554,11 @@ class CoopMenuRuntime:
         self.action_catalog = NativeActionCatalog()
         self.runtime_catalog = BattlePackRuntimeCatalog(
             self.action_catalog,
-            party_member_id=self.session.identity.p2_party_member_id,
+            party_member_id=(
+                self.session.identity.p2_party_member_id
+                if self.session.identity.p2_party_member_id is not None
+                else PENELO_PARTY_MEMBER_ID
+            ),
         )
         gameplay_catalog = self.runtime_catalog.static
         initial_p1_owner = self.session_snapshot.p1_owner_party_member_id
@@ -7221,10 +7236,18 @@ class CoopMenuRuntime:
         return result
 
     def p2_world_interaction_allowed(self) -> bool:
-        return bool(len(self.party) >= 2 and self.follower_world_interaction_allowed())
+        return bool(
+            len(self.party) >= 2
+            and self.party[1][2]
+            and self.follower_world_interaction_allowed()
+        )
 
     def p3_world_interaction_allowed(self) -> bool:
-        return bool(len(self.party) >= 3 and self.follower_world_interaction_allowed())
+        return bool(
+            len(self.party) >= 3
+            and self.party[2][2]
+            and self.follower_world_interaction_allowed()
+        )
 
     def interaction_is_treasure(self, interaction) -> bool:
         if interaction is None:
@@ -7627,13 +7650,6 @@ class CoopMenuRuntime:
                 )
                 else None
             )
-            summon_owner_role = session_state.active_summon_owner_role(
-                snapshot.identity,
-                snapshot.current_layout,
-                snapshot.ui_layout,
-                getattr(snapshot, "leader_party_member_id", None),
-            )
-
             def role_entry(entry, name):
                 if entry is None:
                     return (name, 0, 0)
@@ -7641,42 +7657,20 @@ class CoopMenuRuntime:
                 handle = self.process.u32(actor + 0x08)
                 return (name, handle, actor) if handle else (name, 0, 0)
 
-            if summon_owner_role is not None:
-                # Keep player indices stable while the native summon formation
-                # materializes only its owner and Esper. Compacting P2/P3 into
-                # index zero would route their input through P1.
-                party = [
-                    role_entry(
-                        p1_entry,
-                        session_state.PARTY_NAMES.get(
-                            p1_owner_member_id,
-                            f"Party {p1_owner_member_id}",
-                        ),
+            # Player indices are physical seats, not a compact list of active
+            # characters. An empty P2 seat must never move P3 into index one.
+            party = [
+                role_entry(
+                    p1_entry,
+                    session_state.PARTY_NAMES.get(
+                        p1_owner_member_id,
+                        f"Party {p1_owner_member_id}",
                     ),
-                    role_entry(p2_entry, snapshot.identity.name("p2")),
-                ]
-                if snapshot.identity.p3_party_member_id is not None:
-                    party.append(role_entry(p3_entry, snapshot.identity.name("p3")))
-            else:
-                party = []
-                if p1_entry is not None:
-                    candidate = role_entry(
-                        p1_entry,
-                        session_state.PARTY_NAMES.get(
-                            p1_owner_member_id,
-                            f"Party {p1_owner_member_id}",
-                        ),
-                    )
-                    if candidate[1]:
-                        party.append(candidate)
-                if party and p2_entry is not None:
-                    candidate = role_entry(p2_entry, snapshot.identity.name("p2"))
-                    if candidate[1]:
-                        party.append(candidate)
-                if len(party) >= 2 and p3_entry is not None:
-                    candidate = role_entry(p3_entry, snapshot.identity.name("p3"))
-                    if candidate[1]:
-                        party.append(candidate)
+                ),
+                role_entry(p2_entry, snapshot.identity.name("p2")),
+            ]
+            if snapshot.identity.player_count >= 3:
+                party.append(role_entry(p3_entry, snapshot.identity.name("p3")))
             if self._actor_topology_sample_regressed(snapshot, active_party):
                 # resolve_active_actors() deliberately skips an entry whose
                 # individual pointer sample tears.  Without a generation fence
@@ -7762,8 +7756,10 @@ class CoopMenuRuntime:
         self.p1_model.issuer_party_member_id = int(p1_owner_member_id)
         if len(self.party) >= 2:
             self.model.issuer = self.party[1][1]
-        self.model.issuer_party_member_id = int(
-            snapshot.identity.p2_party_member_id
+        self.model.issuer_party_member_id = (
+            int(snapshot.identity.p2_party_member_id)
+            if snapshot.identity.p2_party_member_id is not None
+            else None
         )
         if len(self.party) >= 3:
             self.p3_model.issuer = self.party[2][1]
@@ -7796,7 +7792,10 @@ class CoopMenuRuntime:
         summon_owner_role = None
         if summon_owner_member_id == snapshot.identity.p1_party_member_id:
             summon_owner_role = "p1"
-        elif summon_owner_member_id == snapshot.identity.p2_party_member_id:
+        elif (
+            snapshot.identity.p2_party_member_id is not None
+            and summon_owner_member_id == snapshot.identity.p2_party_member_id
+        ):
             summon_owner_role = "p2"
         elif (
             snapshot.identity.p3_party_member_id is not None
@@ -8011,7 +8010,11 @@ class CoopMenuRuntime:
         )
         runtime_catalog = BattlePackRuntimeCatalog(
             self.action_catalog,
-            party_member_id=identity.p2_party_member_id,
+            party_member_id=(
+                identity.p2_party_member_id
+                if identity.p2_party_member_id is not None
+                else PENELO_PARTY_MEMBER_ID
+            ),
             gameplay_catalog=gameplay_catalog,
         )
         gameplay_catalog = runtime_catalog.static
@@ -8292,7 +8295,10 @@ class CoopMenuRuntime:
             or len(self.party) < 3
         ):
             return
-        if player == 2 and len(self.party) < 2:
+        if player == 2 and (
+            self.session_snapshot.identity.p2_party_member_id is None
+            or len(self.party) < 2
+        ):
             return
         presenter = {
             1: self.p1_controller.presenter,
@@ -8320,7 +8326,10 @@ class CoopMenuRuntime:
             )
 
     def refresh_runtime_catalogs(self, snapshot, *, force: bool = False) -> None:
-        p2_ready = bool(force or snapshot.gameplay_ready)
+        p2_ready = bool(
+            (force or snapshot.gameplay_ready)
+            and snapshot.identity.p2_party_member_id is not None
+        )
         p1_ready = bool(force or snapshot.p1_gameplay_ready)
         p3_ready = bool(force or p3_session_menu_allowed(snapshot, len(self.party)))
         if not (p1_ready or p2_ready or p3_ready):
@@ -8926,6 +8935,7 @@ class CoopMenuRuntime:
             p1_reserved_member_id,
             p2_member_id,
             p3_member_id,
+            identity.player_count,
         )
         session_state.save_identity(replacement_identity, self.session.path)
         self.session.reload(force=True)
@@ -12218,11 +12228,27 @@ class CoopMenuRuntime:
     ) -> bool:
         active = bool(self.coop_runtime_active and self.native_quickening_active)
         if block_mask is None:
+            snapshot = getattr(self, "session_snapshot", None)
+            identity = getattr(snapshot, "identity", None)
+            p2_occupied = bool(
+                len(self.party) >= 2
+                and (
+                    identity is None
+                    or identity.p2_party_member_id is not None
+                )
+            )
+            p3_occupied = bool(
+                len(self.party) >= 3
+                and (
+                    identity is None
+                    or identity.p3_party_member_id is not None
+                )
+            )
             block_mask = quickening_button_block_mask(
                 active=active,
                 party_size=len(self.party),
-                p2_manual_control=p2_manual_control,
-                p3_manual_control=p3_manual_control,
+                p2_manual_control=bool(p2_manual_control and p2_occupied),
+                p3_manual_control=bool(p3_manual_control and p3_occupied),
             )
         if not active:
             return False
@@ -13245,9 +13271,11 @@ class CoopMenuRuntime:
                 "HEADLESS_MENUS_REENABLED leader=reselected",
                 flush=True,
             )
-        active_actor_alive = (p1_actor_alive,) + (
-            (p2_actor_alive,) if len(self.party) >= 2 else ()
-        ) + ((p3_actor_alive,) if len(self.party) >= 3 else ())
+        active_actor_alive = (p1_actor_alive,)
+        if snapshot.identity.p2_party_member_id is not None:
+            active_actor_alive += (p2_actor_alive,)
+        if snapshot.identity.p3_party_member_id is not None:
+            active_actor_alive += (p3_actor_alive,)
         active_party_dead = native_party_recovery_required(active_actor_alive)
         recovery_was_latched = bool(
             getattr(self, "native_dead_party_recovery_passthrough", False)
@@ -13716,8 +13744,14 @@ class CoopMenuRuntime:
         quickening_policy = quickening_button_block_mask(
             active=bool(self.coop_runtime_active and self.native_quickening_active),
             party_size=len(self.party),
-            p2_manual_control=p2_manual_control_enabled,
-            p3_manual_control=p3_manual_control_enabled,
+            p2_manual_control=bool(
+                p2_manual_control_enabled
+                and snapshot.identity.p2_party_member_id is not None
+            ),
+            p3_manual_control=bool(
+                p3_manual_control_enabled
+                and snapshot.identity.p3_party_member_id is not None
+            ),
         )
         party_menu_policy = bool(
             any(
@@ -14495,7 +14529,11 @@ class CoopMenuRuntime:
 
     def three_player_layout(self) -> bool:
         return bool(
-            self.session_snapshot.identity.player_count >= 3 and len(self.party) >= 3
+            self.session_snapshot.identity.player_count >= 3
+            and self.session_snapshot.identity.p2_party_member_id is not None
+            and self.session_snapshot.identity.p3_party_member_id is not None
+            and len(self.party) >= 3
+            and all(entry[2] for entry in self.party[:3])
         )
 
     def menu_panel_x(self, player: int) -> int:

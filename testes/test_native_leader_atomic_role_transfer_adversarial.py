@@ -219,6 +219,7 @@ class _BridgeScenario:
             "p2": _movement_command(0x54004000, 0, 17),
             "p3": _movement_command(0x54005000, 2, 18),
         }
+        self.role_party_slots = {"p2": 0, "p3": 2}
         self.payload_patches = []
         self.live_mutations = []
         self.flip_journal_on_final_read = False
@@ -384,9 +385,9 @@ class _BridgeScenario:
                 + session_state.BATTLE_PARTY_LAYOUT_STRIDE * layout_index,
                 struct.pack("<4H", *self.layout),
             )
-        for role, actor_id, party_slot, bwei in (
-            ("p2", 1, 0, 0x54008000),
-            ("p3", 2, 2, 0x54009000),
+        for role, actor_id, bwei in (
+            ("p2", 1, 0x54008000),
+            ("p3", 2, 0x54009000),
         ):
             state_sequence_offset = {
                 "p2": coop.NATIVE_LEADER_ROLE_P2_MOVEMENT_SEQUENCE_OFFSET,
@@ -405,7 +406,7 @@ class _BridgeScenario:
                 self.actor_manager + 8 + actor_id * 8,
                 struct.pack("<Q", bwei),
             )
-            emu.mem_write(bwei + 0x12, bytes((party_slot,)))
+            emu.mem_write(bwei + 0x12, bytes((self.role_party_slots[role],)))
             emu.mem_write(bwei + 0x30, struct.pack("<Q", command.actor))
             emu.mem_write(command.actor + 0x08, struct.pack("<I", actor_id))
             emu.mem_write(command.actor + 0x10, struct.pack("<Q", root))
@@ -1225,6 +1226,80 @@ def test_valid_two_player_transfer_keeps_absent_p3_explicit_and_unchanged():
         0,
         coop.INVALID_HUD_PARTY_SLOT,
     )
+
+
+def test_valid_p1_p3_transfer_accepts_an_empty_p2_seat():
+    scenario = _BridgeScenario(p2_changed=False, p3_changed=True)
+    scenario.set_state(
+        coop.NATIVE_LEADER_ROLE_P2_OFFSET,
+        coop.NATIVE_LEADER_ROLE_NONE,
+    )
+    scenario.set_journal(
+        coop.NATIVE_LEADER_JOURNAL_P2_ROLE_OFFSET,
+        coop.NATIVE_LEADER_ROLE_NONE,
+    )
+    scenario.set_state(
+        coop.NATIVE_LEADER_ROLE_P2_HUD_SLOT_OFFSET,
+        coop.INVALID_HUD_PARTY_SLOT,
+    )
+    scenario.set_journal(
+        coop.NATIVE_LEADER_JOURNAL_P2_HUD_SLOT_OFFSET,
+        coop.INVALID_HUD_PARTY_SLOT,
+    )
+    scenario.set_state(coop.NATIVE_LEADER_ROLE_P3_OFFSET, 0)
+    scenario.set_journal(coop.NATIVE_LEADER_JOURNAL_P3_ROLE_OFFSET, 0)
+    scenario.set_state(coop.NATIVE_LEADER_ROLE_P3_HUD_SLOT_OFFSET, 0)
+    scenario.set_journal(coop.NATIVE_LEADER_JOURNAL_P3_HUD_SLOT_OFFSET, 0)
+    scenario.new_commands["p3"] = _movement_command(0x54005000, 0, 18)
+    scenario.role_party_slots["p3"] = 0
+    scenario.old_roles = (0, coop.INVALID_HUD_PARTY_SLOT, 1)
+
+    result = scenario.run()
+
+    assert result.setter_called
+    assert _u32(
+        result.emu,
+        coop.P2_DEVICE_FILTER_STATE + coop.NATIVE_LEADER_APPLIED_SEQUENCE_OFFSET,
+    ) == REQUEST
+    assert bytes(
+        result.emu.mem_read(
+            coop.P2_MOVEMENT_MAILBOX,
+            movement_mailbox.MAILBOX_SIZE,
+        )
+    ) == result.initial_mailboxes["p2"]
+    assert tuple(_u32(result.emu, address) for address in _hud_addresses()) == (
+        1,
+        coop.INVALID_HUD_PARTY_SLOT,
+        0,
+    )
+
+
+def test_valid_transfer_preserves_an_empty_third_player_seat():
+    scenario = _BridgeScenario(p2_changed=True, p3_changed=False)
+    scenario.set_state(
+        coop.NATIVE_LEADER_ROLE_P3_OFFSET,
+        coop.NATIVE_LEADER_ROLE_EMPTY_P3,
+    )
+    scenario.set_journal(
+        coop.NATIVE_LEADER_JOURNAL_P3_ROLE_OFFSET,
+        coop.NATIVE_LEADER_ROLE_EMPTY_P3,
+    )
+    scenario.set_state(
+        coop.NATIVE_LEADER_ROLE_P3_HUD_SLOT_OFFSET,
+        coop.INVALID_HUD_PARTY_SLOT,
+    )
+    scenario.set_journal(
+        coop.NATIVE_LEADER_JOURNAL_P3_HUD_SLOT_OFFSET,
+        coop.INVALID_HUD_PARTY_SLOT,
+    )
+
+    result = scenario.run()
+
+    assert result.setter_called
+    assert _u32(
+        result.emu,
+        coop.P2_DEVICE_FILTER_STATE + coop.NATIVE_LEADER_APPLIED_SEQUENCE_OFFSET,
+    ) == REQUEST
 
 
 class _MemoryProcess:

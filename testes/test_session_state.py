@@ -243,7 +243,10 @@ class SessionStateTests(unittest.TestCase):
                                     if member_id is not None
                                 )
                             )
-                            self.assertEqual(len(roles), len(set(roles)))
+                            assigned_roles = {
+                                member_id for member_id in roles if member_id is not None
+                            }
+                            self.assertEqual(assigned_roles, set(live))
                             if (
                                 configured.p2_party_member_id in live
                                 and leader != configured.p2_party_member_id
@@ -260,8 +263,6 @@ class SessionStateTests(unittest.TestCase):
                                     effective.p3_party_member_id,
                                     configured.p3_party_member_id,
                                 )
-                            if live_count < 3:
-                                self.assertIsNotNone(effective.p3_party_member_id)
                             checked += 1
         self.assertEqual(checked, 102240)
 
@@ -281,7 +282,7 @@ class SessionStateTests(unittest.TestCase):
             }
         )
         identity = state.SessionIdentity.from_config(config)
-        self.assertEqual(identity, state.SessionIdentity(0, 5))
+        self.assertEqual(identity, state.SessionIdentity(0, 5, None, 3))
 
     def test_field_allows_both_menus_and_camera(self):
         snapshot = state.read_snapshot(
@@ -369,7 +370,7 @@ class SessionStateTests(unittest.TestCase):
             (5, state.EMPTY_PARTY_ID),
             leader=5,
         )
-        self.assertEqual(identity, state.SessionIdentity(5, 0))
+        self.assertEqual(identity, state.SessionIdentity(5, None))
 
     def test_nonleader_blocks_only_p1_menu(self):
         snapshot = state.read_snapshot(
@@ -634,6 +635,88 @@ class SessionStateTests(unittest.TestCase):
         )
         self.assertEqual(identity, state.SessionIdentity(0, 1, 5))
 
+    def test_empty_seats_follow_join_order_without_compacting_p3(self):
+        empty = state.EMPTY_PARTY_ID
+        identity = state.SessionIdentity(0, None, None, 3)
+
+        identity = state.available_identity(
+            identity,
+            (0, 5, empty, empty),
+            (0, 5, empty, empty),
+            leader=0,
+        )
+        self.assertEqual(identity, state.SessionIdentity(0, 5, None, 3))
+
+        identity = state.available_identity(
+            identity,
+            (0, 5, 1, empty),
+            (0, 5, 1, empty),
+            leader=0,
+        )
+        self.assertEqual(identity, state.SessionIdentity(0, 5, 1, 3))
+
+        identity = state.available_identity(
+            identity,
+            (0, 1, empty, empty),
+            (0, 1, empty, empty),
+            leader=0,
+        )
+        self.assertEqual(identity, state.SessionIdentity(0, None, 1, 3))
+
+        identity = state.available_identity(
+            identity,
+            (0, empty, empty, empty),
+            (0, empty, empty, empty),
+            leader=0,
+        )
+        self.assertEqual(identity, state.SessionIdentity(0, None, None, 3))
+
+        identity = state.available_identity(
+            identity,
+            (0, 4, empty, empty),
+            (0, 4, empty, empty),
+            leader=0,
+        )
+        self.assertEqual(identity, state.SessionIdentity(0, 4, None, 3))
+
+    def test_p3_remains_gameplay_ready_while_p2_seat_is_empty(self):
+        process = ready_process(leader=0)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        layout = struct.pack("<9H", 0, 1, *([state.EMPTY_PARTY_ID] * 7))
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                layout,
+            )
+
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(0, None, 1, 3),
+            materialized_party_count=2,
+        )
+
+        self.assertTrue(snapshot.gameplay_ready)
+        self.assertTrue(snapshot.movement_allowed)
+        self.assertFalse(snapshot.p2_menu_allowed)
+        self.assertFalse(snapshot.p2_is_leader)
+
+    def test_empty_p2_never_matches_an_unknown_native_leader(self):
+        identity = state.SessionIdentity(0, None, 1, 3)
+        self.assertIsNone(
+            state.ko_promoted_follower_role(
+                identity,
+                None,
+                False,
+                p1_present=True,
+            )
+        )
+        layout = (0, 1, state.EMPTY_PARTY_ID, state.EMPTY_PARTY_ID)
+        self.assertIsNone(
+            state.active_summon_owner_role(identity, layout, layout, None)
+        )
+
     def test_p1_taking_p3_character_preserves_p2_and_swaps_only_p1_p3(self):
         identity = state.available_identity(
             state.SessionIdentity(1, 0, 4),
@@ -876,7 +959,7 @@ class SessionStateTests(unittest.TestCase):
 
         replacement = state.replacement_identity_for_live_party(snapshot)
 
-        self.assertEqual(replacement, state.SessionIdentity(0, 1, 4))
+        self.assertEqual(replacement, state.SessionIdentity(0, None, 4))
 
     def test_removing_p2_does_not_promote_the_active_p3_character(self):
         process = ready_process(leader=5)
@@ -895,7 +978,10 @@ class SessionStateTests(unittest.TestCase):
             materialized_party_count=2,
         )
 
-        self.assertIsNone(state.replacement_identity_for_live_party(snapshot))
+        self.assertEqual(
+            state.replacement_identity_for_live_party(snapshot),
+            state.SessionIdentity(5, None, 4),
+        )
 
     def test_replacing_p2_preserves_the_active_p3_character(self):
         process = ready_process(leader=5)
@@ -918,6 +1004,49 @@ class SessionStateTests(unittest.TestCase):
             state.replacement_identity_for_live_party(snapshot),
             state.SessionIdentity(5, 0, 4),
         )
+
+    def test_departed_p3_releases_the_third_player_seat(self):
+        process = ready_process(leader=0)
+        battle = process.u64(state.BATTLE_INFO_GLOBAL)
+        layout = struct.pack("<9H", 0, 5, *([state.EMPTY_PARTY_ID] * 7))
+        for layout_id in (state.BATTLE_CURRENT_LAYOUT, state.BATTLE_UI_LAYOUT):
+            process.put(
+                battle
+                + state.BATTLE_PARTY_LAYOUT_OFFSET
+                + layout_id * state.BATTLE_PARTY_LAYOUT_STRIDE,
+                layout,
+            )
+        snapshot = state.read_snapshot(
+            process,
+            state.SessionIdentity(0, 5, 1),
+            materialized_party_count=2,
+        )
+
+        self.assertEqual(
+            state.replacement_identity_for_live_party(snapshot),
+            state.SessionIdentity(0, 5, None, 3),
+        )
+
+    def test_empty_follower_seats_fill_in_active_party_order(self):
+        identity = state.SessionIdentity(0, 5, 1)
+        identity = state.available_identity(identity, (0,), (0,), leader=0)
+        self.assertEqual(identity, state.SessionIdentity(0, None, None, 3))
+
+        # The first active follower owns P2; adding a second follower owns P3.
+        identity = state.available_identity(identity, (0, 5), (0, 5), leader=0)
+        self.assertEqual(identity, state.SessionIdentity(0, 5, None, 3))
+        identity = state.available_identity(identity, (0, 5, 1), (0, 5, 1), leader=0)
+        self.assertEqual(identity, state.SessionIdentity(0, 5, 1))
+
+        # Removing P2 does not promote the still-live P3 character.
+        identity = state.available_identity(identity, (0, 1), (0, 1), leader=0)
+        self.assertEqual(identity, state.SessionIdentity(0, None, 1))
+
+        # Once both followers leave, the next character claims the free P2 seat.
+        identity = state.available_identity(identity, (0,), (0,), leader=0)
+        self.assertEqual(identity, state.SessionIdentity(0, None, None, 3))
+        identity = state.available_identity(identity, (0, 4), (0, 4), leader=0)
+        self.assertEqual(identity, state.SessionIdentity(0, 4, None, 3))
 
     def test_live_party_replacement_follows_new_leader_when_p1_is_absent(self):
         process = ready_process(leader=5)
@@ -943,7 +1072,7 @@ class SessionStateTests(unittest.TestCase):
         effective = state.mask_owned_command_shadow(snapshot, owned=True)
         self.assertEqual(
             state.replacement_identity_for_live_party(effective),
-            state.SessionIdentity(5, 0, 1),
+            state.SessionIdentity(5, 0, None, 3),
         )
 
     def test_solo_field_reconciles_an_absent_configured_p1_to_leader(self):
@@ -967,7 +1096,7 @@ class SessionStateTests(unittest.TestCase):
         )
         self.assertEqual(
             state.replacement_identity_for_live_party(snapshot),
-            state.SessionIdentity(5, 0),
+            state.SessionIdentity(5, None),
         )
 
     def test_identity_save_retries_a_transient_windows_replace_lock(self):
@@ -1002,7 +1131,7 @@ class SessionStateTests(unittest.TestCase):
             state.save_identity(state.SessionIdentity(0, 5, 11), path)
             self.assertEqual(
                 state.SessionIdentity.from_config(state.load_config(path)),
-                state.SessionIdentity(0, 5),
+                state.SessionIdentity(0, 5, None, 3),
             )
 
     def test_live_party_replacement_rejects_transient_ui_generation(self):
@@ -1102,7 +1231,7 @@ class SessionStateTests(unittest.TestCase):
         )
         self.assertIsNone(state.replacement_identity_for_live_party(snapshot))
 
-    def test_two_main_members_plus_guest_preserve_the_latent_p3_role(self):
+    def test_two_main_members_plus_guest_release_the_absent_p3_role(self):
         process = ready_process(leader=5)
         battle = process.u64(state.BATTLE_INFO_GLOBAL)
         with_guest = struct.pack(
@@ -1122,10 +1251,10 @@ class SessionStateTests(unittest.TestCase):
         )
         self.assertEqual(
             state.replacement_identity_for_live_party(snapshot),
-            state.SessionIdentity(5, 0, 1),
+            state.SessionIdentity(5, 0, None, 3),
         )
 
-    def test_removed_p1_transfers_its_latent_seat_when_p3_becomes_leader(self):
+    def test_removed_p1_does_not_keep_an_absent_follower_assignment(self):
         process = ready_process(leader=1)
         battle = process.u64(state.BATTLE_INFO_GLOBAL)
         with_guest = struct.pack(
@@ -1144,16 +1273,15 @@ class SessionStateTests(unittest.TestCase):
             materialized_party_count=3,
         )
         replacement = state.replacement_identity_for_live_party(snapshot)
-        self.assertEqual(replacement, state.SessionIdentity(1, 5, 0))
+        self.assertEqual(replacement, state.SessionIdentity(1, 5, None, 3))
         self.assertEqual(
             len(
                 {
                     replacement.p1_party_member_id,
                     replacement.p2_party_member_id,
-                    replacement.p3_party_member_id,
                 }
             ),
-            3,
+            2,
         )
 
 

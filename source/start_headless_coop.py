@@ -646,35 +646,6 @@ def startup_identity(
     return available_identity(configured, current_layout, ui_layout, leader)
 
 
-def preserve_latent_third_player(
-    configured: session_state.SessionIdentity,
-    live: session_state.SessionIdentity,
-) -> session_state.SessionIdentity:
-    """Keep a configured P3 seat without replacing a live P1 or P2 assignment."""
-    if configured.p3_party_member_id is None or live.p3_party_member_id is not None:
-        return live
-
-    occupied = {live.p1_party_member_id, live.p2_party_member_id}
-    latent_p3 = next(
-        (
-            member_id
-            for member_id in (
-                configured.p3_party_member_id,
-                configured.p1_party_member_id,
-                configured.p2_party_member_id,
-            )
-            if member_id in session_state.MAIN_PARTY_MEMBER_IDS
-            and member_id not in occupied
-        ),
-        None,
-    )
-    return session_state.SessionIdentity(
-        live.p1_party_member_id,
-        live.p2_party_member_id,
-        latent_p3,
-    )
-
-
 def sync_identity_to_live_party(
     process,
     actors=None,
@@ -709,13 +680,6 @@ def sync_identity_to_live_party(
         leader,
         p1_alive,
     )
-    active_main_members = session_state.active_main_party_members(current)
-    if (
-        configured.p3_party_member_id is not None
-        and len(active_main_members) < 3
-        and identity.p3_party_member_id is None
-    ):
-        identity = preserve_latent_third_player(configured, identity)
     if identity != configured:
         session_state.save_identity(identity)
         print(
@@ -2746,8 +2710,9 @@ def configured_role_slots(
             ui,
             leader,
         ),
-        "p2": identity.p2_party_member_id,
     }
+    if identity.p2_party_member_id is not None:
+        role_members["p2"] = identity.p2_party_member_id
     if identity.p3_party_member_id is not None:
         role_members["p3"] = identity.p3_party_member_id
     role_slots = {}

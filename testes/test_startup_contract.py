@@ -397,7 +397,7 @@ class StartupMemoryContractTests(unittest.TestCase):
         )
 
         self.assertTrue(ready, diagnostic)
-        self.assertIn("roles={'p1': 5, 'p2': 4}", diagnostic)
+        self.assertIn("roles={'p1': 5}", diagnostic)
         self.assertIn("slots={'p1': 0}", diagnostic)
 
     def test_damage_theme_and_loot_hooks_are_part_of_final_commit(self):

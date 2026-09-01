@@ -1768,6 +1768,21 @@ class ThirdPlayerMenuTests(unittest.TestCase):
         self.assertFalse(live.p3_session_menu_allowed(cutscene, 3))
         self.assertFalse(live.p3_session_menu_allowed(allowed, 2))
 
+    def test_p3_menu_does_not_depend_on_an_occupied_p2_seat(self):
+        snapshot = self.party_menu_snapshot(
+            p2_menu_allowed=False,
+            identity=session_state.SessionIdentity(0, None, 1, 3),
+            chocobo_mode_active=False,
+        )
+
+        self.assertTrue(live.p3_session_menu_allowed(snapshot, 3))
+        self.assertFalse(
+            live.native_party_menu_request_allowed(snapshot, "p2", 3)
+        )
+        self.assertTrue(
+            live.native_party_menu_request_allowed(snapshot, "p3", 3)
+        )
+
     def test_p3_visuals_use_the_same_session_gate_as_input(self):
         dispatch = inspect.getsource(live.CoopMenuRuntime.dispatch_p3)
         run = inspect.getsource(live.CoopMenuRuntime.update_frame)

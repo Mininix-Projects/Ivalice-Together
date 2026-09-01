@@ -760,6 +760,7 @@ NATIVE_LEADER_ROLE_ACTIVE = 2
 NATIVE_LEADER_ROLE_CANCELLING = 3
 NATIVE_LEADER_ROLE_CANCELLED = 4
 NATIVE_LEADER_ROLE_NONE = 0xFFFFFFFF
+NATIVE_LEADER_ROLE_EMPTY_P3 = 0xFFFFFFFE
 
 NATIVE_LEADER_JOURNAL_SEQUENCE_OFFSET = 0x00
 NATIVE_LEADER_JOURNAL_REQUEST_OFFSET = 0x04
@@ -3931,14 +3932,19 @@ def build_native_leader_role_commit_cave() -> bytes:
     cave.extend(b"\x83\xfa\x05")
     validation_jump(0x77)
     cave.extend(b"\x45\x8b\x43" + bytes((NATIVE_LEADER_ROLE_P2_OFFSET,)))
+    cave.extend(b"\x41\x83\xf8\xff")
+    p2_absent = len(cave)
+    cave.extend(b"\x74\x00")
     cave.extend(b"\x41\x83\xf8\x05")
     validation_jump(0x77)
     cave.extend(b"\x44\x39\xc2")
     validation_jump(0x74)
+    p2_valid = len(cave)
+    cave[p2_absent + 1] = (p2_valid - (p2_absent + 2)) & 0xFF
     cave.extend(b"\x45\x8b\x4b" + bytes((NATIVE_LEADER_ROLE_P3_OFFSET,)))
-    cave.extend(b"\x41\x83\xf9\xff")
+    cave.extend(b"\x41\x83\xf9\xfe")
     p3_absent = len(cave)
-    cave.extend(b"\x74\x00")
+    cave.extend(b"\x73\x00")
     cave.extend(b"\x41\x83\xf9\x05")
     validation_jump(0x77)
     cave.extend(b"\x44\x39\xca")
@@ -5568,6 +5574,18 @@ def _role_identity_members(identity: session_state.SessionIdentity) -> tuple[int
     )
 
 
+def _native_role_member(member_id: int | None) -> int:
+    return NATIVE_LEADER_ROLE_NONE if member_id is None else int(member_id)
+
+
+def _native_p3_role_member(identity: session_state.SessionIdentity) -> int:
+    if identity.p3_party_member_id is not None:
+        return int(identity.p3_party_member_id)
+    if identity.player_count >= 3:
+        return NATIVE_LEADER_ROLE_EMPTY_P3
+    return NATIVE_LEADER_ROLE_NONE
+
+
 def native_leader_role_permutation(
     current_identity: session_state.SessionIdentity,
     target_member_id: int,
@@ -5582,12 +5600,14 @@ def native_leader_role_permutation(
             current_identity.p2_party_member_id,
             current_identity.p1_party_member_id,
             current_identity.p3_party_member_id,
+            current_identity.player_count,
         )
     if target_member_id == current_identity.p3_party_member_id:
         return session_state.SessionIdentity(
             int(current_identity.p3_party_member_id),
             current_identity.p2_party_member_id,
             current_identity.p1_party_member_id,
+            current_identity.player_count,
         )
     raise ValueError("native leader target is not owned by a player role")
 
@@ -5702,16 +5722,11 @@ def request_native_leader_role_transfer(
         sequence = (current_request + 1) & 0xFFFFFFFF
         if sequence == 0:
             sequence = 1
-        p3 = (
-            NATIVE_LEADER_ROLE_NONE
-            if replacement.p3_party_member_id is None
-            else int(replacement.p3_party_member_id)
-        )
         role_payload = struct.pack(
             "<13I",
             int(replacement.p1_party_member_id),
-            int(replacement.p2_party_member_id),
-            p3,
+            _native_role_member(replacement.p2_party_member_id),
+            _native_p3_role_member(replacement),
             sequence,
             0,  # prepared sequence -- movement is the sole producer
             0,  # P2 reserved movement sequence
@@ -5819,8 +5834,19 @@ def read_native_leader_role_transfer(
     applied = struct.unpack_from(
         "<I", raw, NATIVE_LEADER_APPLIED_SEQUENCE_OFFSET
     )[0]
-    p3_member_id = None if p3 == NATIVE_LEADER_ROLE_NONE else p3
-    identity = session_state.SessionIdentity(p1, p2, p3_member_id)
+    p2_member_id = None if p2 == NATIVE_LEADER_ROLE_NONE else p2
+    p3_member_id = (
+        None
+        if p3 in (NATIVE_LEADER_ROLE_NONE, NATIVE_LEADER_ROLE_EMPTY_P3)
+        else p3
+    )
+    player_count = 2 if p3 == NATIVE_LEADER_ROLE_NONE else 3
+    identity = session_state.SessionIdentity(
+        p1,
+        p2_member_id,
+        p3_member_id,
+        player_count,
+    )
     members = _role_identity_members(identity)
     accepted_modes = [NATIVE_LEADER_ROLE_ACTIVE]
     if include_inactive:
@@ -5932,12 +5958,8 @@ def read_native_leader_role_journal(process, transfer):
     )
     expected_roles = (
         int(transfer.identity.p1_party_member_id),
-        int(transfer.identity.p2_party_member_id),
-        (
-            NATIVE_LEADER_ROLE_NONE
-            if transfer.identity.p3_party_member_id is None
-            else int(transfer.identity.p3_party_member_id)
-        ),
+        _native_role_member(transfer.identity.p2_party_member_id),
+        _native_p3_role_member(transfer.identity),
     )
     if (
         request != transfer.sequence
@@ -6246,12 +6268,8 @@ def prepare_native_leader_role_transfer(
             journal,
             NATIVE_LEADER_JOURNAL_P1_ROLE_OFFSET,
             int(transfer.identity.p1_party_member_id),
-            int(transfer.identity.p2_party_member_id),
-            (
-                NATIVE_LEADER_ROLE_NONE
-                if transfer.identity.p3_party_member_id is None
-                else int(transfer.identity.p3_party_member_id)
-            ),
+            _native_role_member(transfer.identity.p2_party_member_id),
+            _native_p3_role_member(transfer.identity),
         )
         (
             battle_info,
@@ -7609,7 +7627,7 @@ class NativeKoLeaderOwnershipController:
 
     @staticmethod
     def _replacement(identity, p2_available, p3_available):
-        if p2_available is True:
+        if p2_available is True and identity.p2_party_member_id is not None:
             return "p2", int(identity.p2_party_member_id)
         if p3_available is True and identity.p3_party_member_id is not None:
             return "p3", int(identity.p3_party_member_id)

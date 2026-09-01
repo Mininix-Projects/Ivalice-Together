@@ -126,9 +126,9 @@ class LiveResolutionTests(unittest.TestCase):
     def test_guest_never_becomes_a_follower_role_during_reconcile(self):
         configured = SessionIdentity(0, 5, 1)
         resolved = available_identity(configured, layout(0, 5, 11), layout(0, 5, 11), 0)
-        self.assertEqual(resolved, SessionIdentity(0, 5, None))
+        self.assertEqual(resolved, SessionIdentity(0, 5, None, 3))
 
-    def test_party_shrink_does_not_erase_the_persisted_third_role(self):
+    def test_party_shrink_releases_the_persisted_third_role(self):
         snapshot = SimpleNamespace(
             identity=SessionIdentity(0, 5, 1),
             battle_info=1,
@@ -144,7 +144,7 @@ class LiveResolutionTests(unittest.TestCase):
         replacement = session_state.replacement_identity_for_live_party(
             snapshot,
         )
-        self.assertEqual(replacement, SessionIdentity(5, 0, 1))
+        self.assertEqual(replacement, SessionIdentity(5, 0, None, 3))
 
 
 class PersistenceTests(unittest.TestCase):
@@ -158,6 +158,21 @@ class PersistenceTests(unittest.TestCase):
                 session_state.normalize_config(written)
             )
             self.assertEqual(reloaded.p3_party_member_id, 1)
+
+    def test_empty_three_player_seats_round_trip_without_placeholder_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session_config.json"
+            expected = SessionIdentity(0, None, None, 3)
+            session_state.save_identity(expected, path)
+            written = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(written["player_count"], 3)
+            self.assertIsNone(written["players"]["p2"]["party_member_id"])
+            self.assertIsNone(written["players"]["p3"]["party_member_id"])
+            self.assertEqual(
+                SessionIdentity.from_config(session_state.normalize_config(written)),
+                expected,
+            )
 
     def test_a_two_player_identity_writes_no_p3_key(self):
         with tempfile.TemporaryDirectory() as directory:
