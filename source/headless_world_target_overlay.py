@@ -74,6 +74,10 @@ class LiveTargetInfo:
     viewer_level: int = 0
     hostile: bool = False
 
+    @property
+    def is_ko(self) -> bool:
+        return self.current_hp == 0 or bool(self.status_mask & 1)
+
 
 @dataclass
 class TargetHpAnimator:
@@ -673,6 +677,19 @@ DANGEROUS_LEVEL_GAP = 10
 DANGEROUS_NAME_COLOR = (228, 42, 46)
 
 
+@lru_cache(maxsize=1)
+def ko_badge() -> Image.Image:
+    # Reuse the native skull already shipped with the Pure status sprites.
+    skull = trait_sprite('status/doom')
+    if skull is None:
+        raise FileNotFoundError('native skull asset status/doom.png is missing')
+    scale = status_icon_scale()
+    return skull.resize(
+        (max(1, round(skull.width * scale)), max(1, round(skull.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+
+
 def outclasses_viewer(info: "LiveTargetInfo") -> bool:
     if not info.hostile or not info.viewer_level:
         return False
@@ -1030,6 +1047,13 @@ def render_target_info(
                 image.alpha_composite(
                     scaled, (FLYING_RIGHT_EDGE - scaled.width, FLYING_ROW_Y)
                 )
+
+    if info.is_ko:
+        badge = ko_badge()
+        edge = title_right if framed else FLYING_RIGHT_EDGE
+        top = header_band() + _px(FRAMED_NAME_TOP) if framed else 38
+        image.alpha_composite(badge, (edge - badge.width, top))
+        flying_reserved += badge.width + _px(FRAMED_TITLE_GAP)
 
     type_scale = panel_scale() if framed else 1.0
     LABEL_SCALE = 0.72 * type_scale

@@ -12,6 +12,7 @@ test_camera_zoom_snapshot_emulation.py
 test_city_interaction_passthrough.py
 test_controller_bindings.py
 test_controller_state_transport.py
+test_committed_orientation_and_ko_badge.py
 test_coop_lifecycle.py
 test_d3d_panel_transport.py
 test_external_camera_hold.py

@@ -943,6 +943,52 @@ def camera_direction_from_yaw(yaw):
     return math.sin(yaw), 0.0, math.cos(yaw)
 
 
+def adopt_committed_orientation(process, transfer, p2_token, p3_token,
+                                world_epoch, last_heading, visual_heading,
+                                last_third_player_heading, third_player_visual_heading):
+    """Adopt each changed role's current committed command once, before input.
+
+    Called only by main's validated seamless_role_permutation branch. Never
+    reads an orientation from a different actor, restores a journal snapshot,
+    writes game memory, or changes movement magnitude/camera/role ownership.
+    """
+    result = [last_heading, visual_heading,
+              last_third_player_heading, third_player_visual_heading]
+    if transfer.world_epoch != world_epoch or not transfer.native_applied:
+        raise OSError('orientation adoption requires the current committed world')
+    prior = getattr(process, '_orientation_adopted_roles', {})
+    updated = dict(prior)
+    for role, token, address, index in (
+        ('p2', p2_token, P2_MOVEMENT_MAILBOX, 0),
+        ('p3', p3_token, P3_MOVEMENT_MAILBOX, 2),
+    ):
+        sequence = getattr(transfer, role + '_movement_sequence')
+        if not sequence:
+            continue
+        key = (transfer.sequence, world_epoch, sequence)
+        if prior.get(role) == key:
+            continue
+        command = movement_mailbox.publisher_for(process, address).last_command
+        if command is None:
+            raise OSError('committed orientation command is unavailable')
+        if command.active:
+            if token is None or any(
+                getattr(command, field) != getattr(token, field)
+                for field in ('actor', 'phys', 'member_id', 'actor_generation', 'world_epoch')
+            ):
+                raise OSError('committed orientation identity changed')
+            if command.world_epoch != world_epoch:
+                raise OSError('committed orientation world changed')
+            if not (math.isfinite(command.heading) and math.isfinite(command.visual_heading)):
+                raise OSError('committed orientation is nonfinite')
+            result[index:index + 2] = (command.heading, command.visual_heading)
+        # Inactive KO/manual-off commands have no direction to adopt. Retire
+        # this transaction too; later revival uses normal ACQUIRE_NEW sampling.
+        updated[role] = key
+    process._orientation_adopted_roles = updated
+    return tuple(result)
+
+
 def leader_heading_pair(process, leader_phys):
     if not leader_phys:
         return None
@@ -15144,6 +15190,22 @@ def main():
                     )
                 )
                 if seamless_role_permutation:
+                    (
+                        last_heading,
+                        visual_heading,
+                        last_third_player_heading,
+                        third_player_visual_heading,
+                    ) = adopt_committed_orientation(
+                        process,
+                        leader_role_transfer,
+                        p2_token,
+                        p3_token,
+                        world_epoch,
+                        last_heading,
+                        visual_heading,
+                        last_third_player_heading,
+                        third_player_visual_heading,
+                    )
                     adopted_owners = {}
                     if p2_manual_control and p2_token is not None:
                         adopted_owners["p2"] = p2_token
